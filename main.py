@@ -6,15 +6,12 @@ import os
 app = Flask(__name__)
 CORS(app)  # Abilita CORS per tutte le origini
 
-# Scegli qui il modello che vuoi usare, es: "gpt-4o-mini", "gpt-4o", ecc.
-MODEL_NAME = "gpt-4o"  
-
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
-    messages = data.get("messages", [])
-    if not messages:
-        return jsonify({"response": "Nessuna cronologia messaggi ricevuta"}), 400
+    prompt = data.get("prompt", "")
+    if not prompt:
+        return jsonify({"response": "Nessun prompt ricevuto"}), 400
 
     openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -22,8 +19,8 @@ def chat():
         "Content-Type": "application/json"
     }
     payload = {
-        "model": MODEL_NAME,
-        "messages": messages
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}]
     }
 
     try:
