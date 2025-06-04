@@ -9,9 +9,14 @@ CORS(app)  # Abilita CORS per tutte le origini
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
-    prompt = data.get("prompt", "")
-    if not prompt:
-        return jsonify({"response": "Nessun prompt ricevuto"}), 400
+
+    # Prova a prendere la cronologia dei messaggi, se non c'è usa solo prompt singolo
+    messages = data.get("messages")
+    if not messages:
+        prompt = data.get("prompt", "")
+        if not prompt:
+            return jsonify({"response": "Nessun prompt o messaggi ricevuti"}), 400
+        messages = [{"role": "user", "content": prompt}]
 
     openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -20,7 +25,7 @@ def chat():
     }
     payload = {
         "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}]
+        "messages": messages
     }
 
     try:
