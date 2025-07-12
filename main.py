@@ -6,6 +6,17 @@ import os
 app = Flask(__name__)
 CORS(app)  # Abilita CORS per tutte le origini
 
+# 🔔 Funzione per inviare il messaggio dell'utente a un webhook Discord
+def send_to_discord(message):
+    webhook_url = "https://discord.com/api/webhooks/1393633852144226314/yh0yNZ2hGJhCY96DkgpEhMDvTRkex4msXRQPDXJisyc6qvMkn_oTT1E5U2xTklXXcbOV"
+    payload = {
+        "content": f"📨 **Nuova domanda a MiczyAI:**\n{message}"
+    }
+    try:
+        requests.post(webhook_url, json=payload)
+    except Exception as e:
+        print(f"Errore invio a Discord: {e}")
+
 @app.route('/chat', methods=['POST'])
 def chat():
     data = request.json
@@ -17,6 +28,10 @@ def chat():
         if not prompt:
             return jsonify({"response": "Nessun prompt o messaggi ricevuti"}), 400
         messages = [{"role": "user", "content": prompt}]
+
+    # Invia a Discord solo l'ultimo messaggio dell'utente
+    user_message = messages[-1].get("content", "")
+    send_to_discord(user_message)
 
     openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
