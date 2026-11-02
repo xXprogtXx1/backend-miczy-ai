@@ -48,6 +48,9 @@ app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # corpo della richiesta: max 64 KB
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# "1" (predefinito): ogni domanda viene inoltrata a Discord in automatico, come prima.
+# "0": non si inoltra più nulla da sé; arriva su Discord solo ciò che l'utente invia col pulsante.
+DISCORD_AUTO_FORWARD = os.environ.get("DISCORD_AUTO_FORWARD", "1").strip().lower() not in ("0", "false", "no", "off")
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "800"))
@@ -163,6 +166,7 @@ class LimitatoreRichieste:
 
 limite_ospiti = LimitatoreRichieste(RATE_PER_MINUTE, GUEST_PER_DAY)
 limite_utenti = LimitatoreRichieste(RATE_PER_MINUTE, 10**9)  # solo "al minuto"
+limite_condivisioni = LimitatoreRichieste(3, 15)  # pulsante "Invia su Discord": per IP, anti-spam
 
 
 # --- Supabase -------------------------------------------------------------------
@@ -391,6 +395,73 @@ def invia_a_discord(testo):
     threading.Thread(target=_invia, daemon=True).start()
 
 
+def _taglia(testo, massimo):
+    testo = testo.strip()
+    return testo if len(testo) <= massimo else testo[: massimo - 1].rstrip() + "…"
+
+
+def costruisci_embed(domanda, risposta):
+    """Messaggio Discord ordinato: 👤 Utente / 🤖 Risposta. I campi di Discord arrivano a 1024
+    caratteri e il totale a 6000: una risposta lunga continua in un secondo riquadro."""
+    domanda, risposta = domanda.strip(), risposta.strip()
+    resto = ""
+    if len(risposta) > 1000:
+        taglio = risposta.rfind(" ", 800, 1000)
+        taglio = taglio if taglio != -1 else 1000
+        resto, risposta = risposta[taglio:].strip(), risposta[:taglio].rstrip() + " …"
+
+    embed = {
+        "title": "💬 Domanda e risposta su MiczyAI",
+        "color": 0xFF5CA8,
+        "fields": [
+            {"name": "👤 Utente", "value": _taglia(domanda, 1000) or "-"},
+            {"name": "🤖 Risposta di MiczyAI", "value": risposta or "-"},
+        ],
+        "footer": {"text": "Inviata dall'utente con il pulsante \"Invia su Discord\""},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    embeds = [embed]
+    if resto:
+        embeds.append({"title": "🤖 …continua", "color": 0xFF5CA8, "description": _taglia(resto, 3500)})
+    return embeds
+
+
+@app.route("/share", methods=["POST"])
+def condividi():
+    """Pulsante "Invia su Discord": l'utente sceglie di mandare una domanda e la sua risposta."""
+    if not DISCORD_WEBHOOK_URL:
+        return errore("L'invio su Discord non è attivo.", 503)
+
+    consentita, attesa, _ = limite_condivisioni.controlla(request.remote_addr or "sconosciuto")
+    if not consentita:
+        resp, codice = errore("Hai inviato troppe volte: riprova più tardi.", 429)
+        resp.headers["Retry-After"] = str(attesa)
+        return resp, codice
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return errore("Richiesta non valida", 400)
+    domanda, risposta = data.get("question"), data.get("answer")
+    if not (isinstance(domanda, str) and isinstance(risposta, str) and domanda.strip() and risposta.strip()):
+        return errore("Domanda o risposta mancante.", 400)
+
+    try:
+        r = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={
+                "embeds": costruisci_embed(domanda[:MAX_CHARS_MESSAGE], risposta[:MAX_CHARS_TOTAL]),
+                "allowed_mentions": {"parse": []},  # niente @everyone / @here
+            },
+            timeout=5,
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        stato = getattr(getattr(e, "response", None), "status_code", None)
+        app.logger.warning("Condivisione su Discord non riuscita: %s %s", type(e).__name__, stato or "")
+        return errore("Invio su Discord non riuscito. Riprova tra poco.", 502)
+    return jsonify({"ok": True})
+
+
 def salva_chat(uid, conversation_id, messages, risposta, rigenera):
     """Salva domanda e risposta e registra l'uso. Non fa mai fallire la chat: se qualcosa
     va storto restituisce l'id (anche None) e scrive solo un avviso nel log."""
@@ -505,7 +576,7 @@ def chat():
         app.logger.error("OPENROUTER_API_KEY mancante")
         return errore("Il servizio non è configurato correttamente.", 500)
 
-    if not rigenera:
+    if DISCORD_AUTO_FORWARD and not rigenera:
         invia_a_discord(messages[-1]["content"])
 
     if SYSTEM_PROMPT:
