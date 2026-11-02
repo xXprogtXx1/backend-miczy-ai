@@ -533,6 +533,10 @@ def chat():
         except Exception:
             pass
         app.logger.warning("OpenRouter: errore HTTP %s - %s", stato, motivo)
+        if stato in (401, 403):  # aiuta a capire QUALE chiave sta usando il servizio (mai intera)
+            k = OPENROUTER_API_KEY
+            app.logger.warning("Chiave usata: lunghezza=%d, inizia con %r, finisce con %r, spazi/a capo ai bordi=%s",
+                               len(k), k[:6], k[-4:], k != k.strip())
         if stato == 429:
             return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
         # il codice (401 chiave non valida, 402 crediti, 404 modello...) aiuta a capire cosa non va
