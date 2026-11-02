@@ -75,6 +75,8 @@ if not ALLOWED_ORIGINS:
     app.logger.warning("ALLOWED_ORIGINS non impostata: CORS aperto a tutti i siti.")
 if not OPENROUTER_API_KEY:
     app.logger.warning("OPENROUTER_API_KEY non impostata: /chat risponderà con errore.")
+if not DISCORD_WEBHOOK_URL:
+    app.logger.warning("DISCORD_WEBHOOK_URL non impostata: le domande non vengono inviate a Discord.")
 if not ACCOUNTS_ATTIVI:
     app.logger.warning("Supabase non configurato: account, chat salvate e admin disattivati.")
     # Diagnostica: SOLO i nomi (mai i valori) delle variabili d'ambiente rilevanti. repr() fa
@@ -371,7 +373,7 @@ def invia_a_discord(testo):
 
     def _invia():
         try:
-            requests.post(
+            r = requests.post(
                 DISCORD_WEBHOOK_URL,
                 json={
                     "content": f"📨 **Nuova domanda a MiczyAI:**\n{testo[:1800]}",
@@ -379,6 +381,10 @@ def invia_a_discord(testo):
                 },
                 timeout=5,
             )
+            if r.status_code >= 400:
+                # 404 = webhook cancellato (Discord lo fa se trova l'indirizzo in un repo pubblico),
+                # 401/403 = indirizzo non valido, 429 = troppi messaggi
+                app.logger.warning("Discord ha rifiutato il messaggio: HTTP %s", r.status_code)
         except requests.RequestException as e:
             app.logger.warning("Invio a Discord non riuscito: %s", type(e).__name__)
 
