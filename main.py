@@ -507,33 +507,33 @@ def chat():
         answer = (
             resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
         )
-    except requests.Timeout:
-    app.logger.warning("OpenRouter: timeout")
-    return errore("L'IA ci sta mettendo troppo. Riprova tra poco.", 504)
+            except requests.Timeout:
+            app.logger.warning("OpenRouter: timeout")
+            return errore("L'IA ci sta mettendo troppo. Riprova tra poco.", 504)
 
-except requests.HTTPError as e:
-    stato = e.response.status_code if e.response is not None else 0
+        except requests.HTTPError as e:
+            stato = e.response.status_code if e.response is not None else 0
 
-    try:
-        risposta = e.response.json()
-        dettaglio = risposta.get("error", {}).get("message", "Dettaglio non disponibile")
-    except (ValueError, AttributeError):
-        dettaglio = "Risposta non leggibile"
+            try:
+                risposta = e.response.json()
+                dettaglio = risposta.get("error", {}).get("message", "Dettaglio non disponibile")
+            except (ValueError, AttributeError):
+                dettaglio = "Risposta non leggibile"
 
-    app.logger.warning(
-        "OpenRouter HTTP %s - Dettaglio: %s",
-        stato,
-        str(dettaglio)[:500]
-    )
+            app.logger.warning(
+                "OpenRouter HTTP %s - Dettaglio: %s",
+                stato,
+                str(dettaglio)[:500]
+            )
 
-    if stato == 429:
-        return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
+            if stato == 429:
+                return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
 
-    return errore("Errore nella chiamata all'IA.", 502)
+            return errore("Errore nella chiamata all'IA.", 502)
 
-except (requests.RequestException, ValueError) as e:
-    app.logger.warning("OpenRouter: %s", type(e).__name__)
-    return errore("Errore nella chiamata all'IA.", 502)
+        except (requests.RequestException, ValueError) as e:
+            app.logger.warning("OpenRouter: %s", type(e).__name__)
+            return errore("Errore nella chiamata all'IA.", 502)
 
     # 6) Salvataggio (solo utenti registrati)
     risultato = {"response": answer}
