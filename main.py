@@ -77,6 +77,21 @@ if not OPENROUTER_API_KEY:
     app.logger.warning("OPENROUTER_API_KEY non impostata: /chat risponderà con errore.")
 if not ACCOUNTS_ATTIVI:
     app.logger.warning("Supabase non configurato: account, chat salvate e admin disattivati.")
+    # Diagnostica: SOLO i nomi (mai i valori) delle variabili d'ambiente rilevanti. repr() fa
+    # vedere spazi o caratteri invisibili nei nomi, la causa più comune di questo problema.
+    _mancanti = [n for n, v in (("SUPABASE_URL", SUPABASE_URL),
+                                ("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY),
+                                ("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY)) if not v]
+    _simili = sorted(repr(k) for k in os.environ
+                     if "SUPA" in k.upper() or "ALLOW" in k.upper() or "ORIGIN" in k.upper())
+    app.logger.warning("Variabili vuote o mancanti: %s", ", ".join(_mancanti) or "nessuna")
+    app.logger.warning("Nomi simili trovati nell'ambiente: %s", ", ".join(_simili) or "nessuno")
+    # Quale servizio Render sta girando davvero (id e nome non sono segreti)
+    app.logger.warning("Servizio Render in esecuzione: id=%s nome=%s",
+                       os.environ.get("RENDER_SERVICE_ID", "?"), os.environ.get("RENDER_SERVICE_NAME", "?"))
+    # Tutti i NOMI delle variabili ricevute (mai i valori)
+    app.logger.warning("Tutte le variabili ricevute (solo nomi): %s",
+                       ", ".join(sorted(repr(k) for k in os.environ)))
 
 
 # --- CORS ---------------------------------------------------------------------
@@ -512,7 +527,12 @@ def chat():
         return errore("L'IA ci sta mettendo troppo. Riprova tra poco.", 504)
     except requests.HTTPError as e:
         stato = e.response.status_code if e.response is not None else 0
-        app.logger.warning("OpenRouter: errore HTTP %s", stato)
+        motivo = ""
+        try:  # il motivo spiegato da OpenRouter (es. "No auth credentials found", "Insufficient credits")
+            motivo = (e.response.text or "")[:300].replace("\n", " ")
+        except Exception:
+            pass
+        app.logger.warning("OpenRouter: errore HTTP %s - %s", stato, motivo)
         if stato == 429:
             return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
         return errore("Errore nella chiamata all'IA.", 502)
