@@ -86,6 +86,12 @@ if not ACCOUNTS_ATTIVI:
                      if "SUPA" in k.upper() or "ALLOW" in k.upper() or "ORIGIN" in k.upper())
     app.logger.warning("Variabili vuote o mancanti: %s", ", ".join(_mancanti) or "nessuna")
     app.logger.warning("Nomi simili trovati nell'ambiente: %s", ", ".join(_simili) or "nessuno")
+    # Quale servizio Render sta girando davvero (id e nome non sono segreti)
+    app.logger.warning("Servizio Render in esecuzione: id=%s nome=%s",
+                       os.environ.get("RENDER_SERVICE_ID", "?"), os.environ.get("RENDER_SERVICE_NAME", "?"))
+    # Tutti i NOMI delle variabili ricevute (mai i valori)
+    app.logger.warning("Tutte le variabili ricevute (solo nomi): %s",
+                       ", ".join(sorted(repr(k) for k in os.environ)))
 
 
 # --- CORS ---------------------------------------------------------------------
