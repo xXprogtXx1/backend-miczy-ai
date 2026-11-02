@@ -535,7 +535,8 @@ def chat():
         app.logger.warning("OpenRouter: errore HTTP %s - %s", stato, motivo)
         if stato == 429:
             return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
-        return errore("Errore nella chiamata all'IA.", 502)
+        # il codice (401 chiave non valida, 402 crediti, 404 modello...) aiuta a capire cosa non va
+        return errore(f"Errore nella chiamata all'IA (codice {stato}).", 502)
     except (requests.RequestException, ValueError) as e:
         app.logger.warning("OpenRouter: %s", type(e).__name__)
         return errore("Errore nella chiamata all'IA.", 502)
