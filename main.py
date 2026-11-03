@@ -20,7 +20,6 @@ Tutte le impostazioni arrivano dalle variabili d'ambiente di Render, MAI dal cod
     GUEST_PER_DAY           messaggi al giorno per ospite (per IP), default 20
     USER_PER_DAY            messaggi al giorno per utente registrato, default 100
     SYSTEM_PROMPT           istruzioni fisse per l'IA
-    DISCORD_ADMIN_ALERTS    "0" per non ricevere su Discord gli avvisi (nuovo utente, sospensioni), default 1
     PRICE_IN_PER_M          costo in dollari per milione di token in ingresso (stima costi), default 0.15
     PRICE_OUT_PER_M         costo in dollari per milione di token in uscita, default 0.60
 
@@ -80,7 +79,6 @@ def _numero(nome, predefinito):
 
 PRICE_IN_PER_M = _numero("PRICE_IN_PER_M", 0.15)    # dollari per milione di token (gpt-4o-mini)
 PRICE_OUT_PER_M = _numero("PRICE_OUT_PER_M", 0.60)
-DISCORD_ADMIN_ALERTS = os.environ.get("DISCORD_ADMIN_ALERTS", "1").strip().lower() not in ("0", "false", "no", "off")
 ALLOWED_ORIGINS = [
     o.strip().rstrip("/").lower()
     for o in os.environ.get("ALLOWED_ORIGINS", "").split(",")
@@ -392,19 +390,6 @@ def _per_discord(testo):
     return str(testo or "").replace("`", "'").replace("\n", " ")[:200]
 
 
-def avviso_admin(testo):
-    """Messaggio per l'admin sul canale Discord (nuovo utente, sospensione...)."""
-    if not (DISCORD_WEBHOOK_URL and DISCORD_ADMIN_ALERTS):
-        return
-
-    def _invia():
-        r = requests.post(DISCORD_WEBHOOK_URL,
-                          json={"content": testo[:1800], "allowed_mentions": {"parse": []}}, timeout=5)
-        if r.status_code >= 400:
-            app.logger.warning("Discord ha rifiutato l'avviso admin: HTTP %s", r.status_code)
-    in_background(_invia)
-
-
 def registra_azione(admin, azione, target_id=None, target_email=None, dettagli=None):
     """Aggiunge una riga al registro delle azioni dell'admin (se la migrazione è stata fatta)."""
     corpo = {"admin_id": admin.get("id"), "admin_email": admin.get("email"), "action": azione,
@@ -416,23 +401,6 @@ def registra_azione(admin, azione, target_id=None, target_email=None, dettagli=N
         except SupabaseNonDisponibile as e:
             avvisa_una_volta("admin_log", f"Registro azioni non scritto ({e}): hai eseguito migrazione-admin.sql?")
     in_background(_scrivi)
-
-
-def avvisa_se_nuovo(profilo):
-    """Prima volta che un utente nuovo si fa vedere: avvisa l'admin su Discord, una volta sola."""
-    if not _colonna_notifica or "notified_at" not in profilo or profilo.get("notified_at"):
-        return
-    uid, email = profilo.get("id"), profilo.get("email")
-
-    def _lavoro():
-        # "is.null" nel filtro: se due richieste arrivano insieme, solo una vince e avvisa
-        r = sb("PATCH", "/rest/v1/profiles", params={"id": f"eq.{uid}", "notified_at": "is.null"},
-               corpo={"notified_at": datetime.now(timezone.utc).isoformat()},
-               extra={"Prefer": "return=representation"})
-        if r.json():
-            invalida_profilo(uid)
-            avviso_admin(f"🆕 **Nuovo utente su MiczyAI:** `{_per_discord(email)}`")
-    in_background(_lavoro)
 
 
 def registra_token(uid, tin, tout):
@@ -892,7 +860,6 @@ def chat():
         fine = ban_attivo(profilo)
         if fine:
             return errore(testo_ban(profilo, fine), 403)
-        avvisa_se_nuovo(profilo)
 
     # 4) Limiti
     if uid:
@@ -1173,8 +1140,6 @@ def me():
         return errore_admin("Account non disponibili al momento", 503)
 
     fine = ban_attivo(profilo)
-    if not fine:
-        avvisa_se_nuovo(profilo)
     return jsonify({
         "id": utente["id"],
         "email": utente["email"],
@@ -1287,8 +1252,6 @@ def admin_ban():
     durata = "per sempre" if fine >= BAN_PERMANENTE - timedelta(days=1) \
         else "fino al " + fine.astimezone(FUSO).strftime("%d/%m/%Y %H:%M")
     registra_azione(admin, "ban", uid, profilo.get("email"), f"{durata}" + (f" - {motivo}" if motivo else ""))
-    avviso_admin(f"🚫 **Utente sospeso:** `{_per_discord(profilo.get('email'))}` ({durata})"
-                 + (f"\nMotivo: {_per_discord(motivo)}" if motivo else ""))
     return jsonify({"ok": True, "banned_until": fine.isoformat()})
 
 
@@ -1589,7 +1552,6 @@ def admin_elimina_utente():
     dimentica_utente(uid)
     app.logger.info("ADMIN %s ha eliminato l'account %s", admin["id"], uid)
     registra_azione(admin, "delete_user", uid, email or None, "account e dati cancellati")
-    avviso_admin(f"🗑️ **Account eliminato:** `{_per_discord(email or uid)}`")
     return jsonify({"ok": True})
 
 
