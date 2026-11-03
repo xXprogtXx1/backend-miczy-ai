@@ -24,6 +24,8 @@ Tutte le impostazioni arrivano dalle variabili d'ambiente di Render, MAI dal cod
     PRICE_IN_PER_M          costo in dollari per milione di token in ingresso (stima costi), default 0.15
     PRICE_OUT_PER_M         costo in dollari per milione di token in uscita, default 0.60
 
+  Streaming, pollice su/giù, link di condivisione e cartelle richiedono migrazione-chat.sql.
+
   Dal pannello admin (salvate nel database, non servono variabili): modalità manutenzione,
   avviso in cima al sito, limiti di messaggi, personalità del bot. Richiedono migrazione-admin.sql.
 """
@@ -32,6 +34,8 @@ import copy
 import hashlib
 import json
 import os
+import re
+import secrets
 import threading
 import time
 import uuid
@@ -39,7 +43,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 try:
@@ -187,6 +191,9 @@ class LimitatoreRichieste:
 limite_ospiti = LimitatoreRichieste(RATE_PER_MINUTE, GUEST_PER_DAY)
 limite_utenti = LimitatoreRichieste(RATE_PER_MINUTE, 10**9)  # solo "al minuto"
 limite_condivisioni = LimitatoreRichieste(3, 15)  # pulsante "Invia su Discord": per IP, anti-spam
+limite_feedback = LimitatoreRichieste(30, 2000)   # pollice su/giù: per utente
+limite_link = LimitatoreRichieste(10, 200)        # creare/revocare link di condivisione: per utente
+limite_letture = LimitatoreRichieste(30, 3000)    # aprire un link condiviso: per IP
 
 
 # --- Supabase -------------------------------------------------------------------
@@ -714,7 +721,9 @@ def condividi():
 
 def salva_chat(uid, conversation_id, messages, risposta, rigenera):
     """Salva domanda e risposta e registra l'uso. Non fa mai fallire la chat: se qualcosa
-    va storto restituisce l'id (anche None) e scrive solo un avviso nel log."""
+    va storto restituisce l'id (anche None) e scrive solo un avviso nel log.
+    Restituisce (id_chat, id_della_risposta_salvata)."""
+    message_id = None
     try:
         # Prima l'uso: così il limite giornaliero vale anche se il resto del salvataggio fallisce
         sb("POST", "/rest/v1/usage_log", corpo={"user_id": uid})
@@ -740,12 +749,113 @@ def salva_chat(uid, conversation_id, messages, risposta, rigenera):
             nuovi.insert(0, {"conversation_id": conversation_id, "user_id": uid,
                              "role": "user", "content": messages[-1]["content"]})
 
-        sb("POST", "/rest/v1/messages", corpo=nuovi)
+        r = sb("POST", "/rest/v1/messages", corpo=nuovi, extra={"Prefer": "return=representation"})
+        try:  # l'id serve al sito per il pollice su/giù
+            ids = [m["id"] for m in r.json() if m.get("role") == "assistant"]
+            message_id = ids[-1] if ids else None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            message_id = None
         sb("PATCH", "/rest/v1/conversations", params={"id": f"eq.{conversation_id}"},
            corpo={"updated_at": datetime.now(timezone.utc).isoformat()})
     except (SupabaseNonDisponibile, KeyError, IndexError, ValueError) as e:
         app.logger.warning("Salvataggio chat non riuscito: %s", e)
-    return conversation_id
+    return conversation_id, message_id
+
+
+# --- Risposta dell'IA: errori, token, streaming ------------------------------------
+
+def risposta_errore_ia(e):
+    """Trasforma un errore di OpenRouter in una risposta per il sito."""
+    if isinstance(e, requests.Timeout):
+        app.logger.warning("OpenRouter: timeout")
+        return errore("L'IA ci sta mettendo troppo. Riprova tra poco.", 504)
+    if isinstance(e, requests.HTTPError):
+        stato = e.response.status_code if e.response is not None else 0
+        motivo = ""
+        try:  # il motivo spiegato da OpenRouter (es. "No auth credentials found", "Insufficient credits")
+            motivo = (e.response.text or "")[:300].replace("\n", " ")
+        except Exception:
+            pass
+        app.logger.warning("OpenRouter: errore HTTP %s - %s", stato, motivo)
+        if stato in (401, 403):  # aiuta a capire QUALE chiave sta usando il servizio (mai intera)
+            k = OPENROUTER_API_KEY
+            app.logger.warning("Chiave usata: lunghezza=%d, inizia con %r, finisce con %r, spazi/a capo ai bordi=%s",
+                               len(k), k[:6], k[-4:], k != k.strip())
+        if stato == 429:
+            return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
+        # il codice (401 chiave non valida, 402 crediti, 404 modello...) aiuta a capire cosa non va
+        return errore(f"Errore nella chiamata all'IA (codice {stato}).", 502)
+    app.logger.warning("OpenRouter: %s", type(e).__name__)
+    return errore("Errore nella chiamata all'IA.", 502)
+
+
+def registra_uso_risposta(uid, uso, messages_modello, answer):
+    """Token usati da una risposta (statistiche e costi). Se OpenRouter non li dà si stimano dai caratteri."""
+    if not (ACCOUNTS_ATTIVI and answer):
+        return
+    tin = uso.get("prompt_tokens")
+    tout = uso.get("completion_tokens")
+    if not isinstance(tin, int):
+        tin = sum(len(m["content"]) for m in messages_modello) // 4
+    if not isinstance(tout, int):
+        tout = len(answer) // 4
+    in_background(registra_token, uid, tin, tout)
+
+
+def _evento(oggetto):
+    return "data: " + json.dumps(oggetto, ensure_ascii=False) + "\n\n"
+
+
+def flusso_risposta(resp, uid, conversation_id, messages, messages_modello, rigenera):
+    """Inoltra al sito la risposta a poco a poco (Server-Sent Events). Eventi:
+    {"delta": "testo"} per ogni pezzetto; alla fine {"done": true, "response": ..., "conversation_id": ...,
+    "message_id": ...}; se qualcosa va storto {"error": "..."}. La chat si salva solo a risposta completa."""
+    pezzi, uso = [], {}
+    try:
+        for riga in resp.iter_lines(decode_unicode=True):
+            if not riga or not riga.startswith("data:"):
+                continue
+            dato = riga[5:].strip()
+            if dato == "[DONE]":
+                break
+            try:
+                blocco = json.loads(dato)
+            except ValueError:
+                continue
+            if not isinstance(blocco, dict):
+                continue
+            if isinstance(blocco.get("error"), dict):  # errore a metà risposta
+                app.logger.warning("OpenRouter: errore nel flusso - %s", str(blocco["error"].get("message"))[:200])
+                yield _evento({"error": "La risposta si è interrotta. Riprova."})
+                return
+            if isinstance(blocco.get("usage"), dict):
+                uso = blocco["usage"]
+            for scelta in blocco.get("choices") or []:
+                testo = (scelta.get("delta") or {}).get("content")
+                if isinstance(testo, str) and testo:
+                    pezzi.append(testo)
+                    yield _evento({"delta": testo})
+    except requests.RequestException as e:
+        app.logger.warning("OpenRouter: flusso interrotto (%s)", type(e).__name__)
+        yield _evento({"error": "La risposta si è interrotta. Riprova."})
+        return
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+    answer = "".join(pezzi)
+    if not answer.strip():
+        yield _evento({"error": "L'IA non ha risposto. Riprova."})
+        return
+    registra_uso_risposta(uid, uso, messages_modello, answer)
+    finale = {"done": True, "response": answer}
+    if uid:
+        finale["conversation_id"], id_risposta = salva_chat(uid, conversation_id, messages, answer, rigenera)
+        if id_risposta:
+            finale["message_id"] = id_risposta
+    yield _evento(finale)
 
 
 # --- Rotta principale: chat -----------------------------------------------------
@@ -842,59 +952,201 @@ def chat():
     else:
         messages_modello = messages
 
-    # 6) Il modello
+    # 6) Il modello (risposta intera, oppure a poco a poco se il sito lo chiede con "stream": true)
+    in_streaming = data.get("stream") is True
     try:
+        corpo_ia = {"model": MODEL, "messages": messages_modello, "max_tokens": MAX_TOKENS}
+        extra_richiesta = {}
+        if in_streaming:
+            corpo_ia.update(stream=True, stream_options={"include_usage": True})
+            extra_richiesta["stream"] = True
         resp = requests.post(
             OPENROUTER_URL,
             headers={
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={"model": MODEL, "messages": messages_modello, "max_tokens": MAX_TOKENS},
+            json=corpo_ia,
             timeout=(5, 45),  # connessione, lettura
+            **extra_richiesta,
         )
         resp.raise_for_status()
-        dati_ia = resp.json()
-        answer = dati_ia.get("choices", [{}])[0].get("message", {}).get("content", "")
-        uso = dati_ia.get("usage") if isinstance(dati_ia.get("usage"), dict) else {}
-    except requests.Timeout:
-        app.logger.warning("OpenRouter: timeout")
-        return errore("L'IA ci sta mettendo troppo. Riprova tra poco.", 504)
-    except requests.HTTPError as e:
-        stato = e.response.status_code if e.response is not None else 0
-        motivo = ""
-        try:  # il motivo spiegato da OpenRouter (es. "No auth credentials found", "Insufficient credits")
-            motivo = (e.response.text or "")[:300].replace("\n", " ")
-        except Exception:
-            pass
-        app.logger.warning("OpenRouter: errore HTTP %s - %s", stato, motivo)
-        if stato in (401, 403):  # aiuta a capire QUALE chiave sta usando il servizio (mai intera)
-            k = OPENROUTER_API_KEY
-            app.logger.warning("Chiave usata: lunghezza=%d, inizia con %r, finisce con %r, spazi/a capo ai bordi=%s",
-                               len(k), k[:6], k[-4:], k != k.strip())
-        if stato == 429:
-            return errore("L'IA è molto richiesta in questo momento. Riprova tra poco.", 503)
-        # il codice (401 chiave non valida, 402 crediti, 404 modello...) aiuta a capire cosa non va
-        return errore(f"Errore nella chiamata all'IA (codice {stato}).", 502)
+        if not in_streaming:
+            dati_ia = resp.json()
+            answer = dati_ia.get("choices", [{}])[0].get("message", {}).get("content", "")
+            uso = dati_ia.get("usage") if isinstance(dati_ia.get("usage"), dict) else {}
     except (requests.RequestException, ValueError) as e:
-        app.logger.warning("OpenRouter: %s", type(e).__name__)
-        return errore("Errore nella chiamata all'IA.", 502)
+        return risposta_errore_ia(e)
 
-    # 7) Token usati (statistiche e costi); se OpenRouter non li dà si stimano dai caratteri
-    if ACCOUNTS_ATTIVI and answer:
-        tin = uso.get("prompt_tokens")
-        tout = uso.get("completion_tokens")
-        if not isinstance(tin, int):
-            tin = sum(len(m["content"]) for m in messages_modello) // 4
-        if not isinstance(tout, int):
-            tout = len(answer) // 4
-        in_background(registra_token, uid, tin, tout)
+    if in_streaming:
+        return Response(
+            flusso_risposta(resp, uid, conversation_id, messages, messages_modello, rigenera),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 7) Token usati (statistiche e costi)
+    registra_uso_risposta(uid, uso, messages_modello, answer)
 
     # 8) Salvataggio (solo utenti registrati)
     risultato = {"response": answer}
     if uid and answer:
-        risultato["conversation_id"] = salva_chat(uid, conversation_id, messages, answer, rigenera)
+        risultato["conversation_id"], id_risposta = salva_chat(uid, conversation_id, messages, answer, rigenera)
+        if id_risposta:
+            risultato["message_id"] = id_risposta
     return jsonify(risultato)
+
+
+# --- Pollice su/giù e condivisione di una chat ---------------------------------------
+
+def richiedi_utente():
+    """Restituisce (utente, None) se c'è un accesso valido, altrimenti (None, risposta_di_errore)."""
+    if not ACCOUNTS_ATTIVI:
+        return None, errore("Account non attivi", 404)
+    token = token_della_richiesta()
+    if not token:
+        return None, errore("Accesso richiesto", 401)
+    try:
+        utente = verifica_token(token)
+    except SupabaseNonDisponibile as e:
+        app.logger.warning("Supabase non disponibile: %s", e)
+        return None, errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
+    if not utente:
+        return None, errore("Sessione scaduta: accedi di nuovo.", 401)
+    return utente, None
+
+
+def _troppe(attesa):
+    resp, codice = errore("Troppe richieste: aspetta un po' e riprova.", 429)
+    resp.headers["Retry-After"] = str(attesa)
+    return resp, codice
+
+
+def _manca_migrazione(e):
+    if "HTTP 404" in str(e):
+        app.logger.warning("Tabella mancante (%s): hai eseguito migrazione-chat.sql su Supabase?", e)
+        return errore("Questa funzione non è ancora attiva. Riprova più tardi.", 503)
+    return errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
+
+
+@app.route("/feedback", methods=["POST"])
+def feedback():
+    """Pollice su (1), giù (-1) o rimosso (0) su una risposta salvata dell'utente."""
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    consentita, attesa, _ = limite_feedback.controlla(utente["id"])
+    if not consentita:
+        return _troppe(attesa)
+    data = _corpo_json()
+    mid, voto = data.get("message_id"), data.get("rating")
+    if isinstance(mid, bool) or not isinstance(mid, int) or not 0 < mid < 2**62:
+        return errore("Risposta non valida", 400)
+    if isinstance(voto, bool) or voto not in (1, -1, 0):
+        return errore("Voto non valido", 400)
+    uid = utente["id"]
+    try:
+        # solo le risposte dell'IA nelle proprie chat
+        righe = sb("GET", "/rest/v1/messages", params={
+            "id": f"eq.{mid}", "user_id": f"eq.{uid}", "role": "eq.assistant", "select": "id"}).json()
+        if not righe:
+            return errore("Risposta non trovata", 404)
+        if voto == 0:
+            sb("DELETE", "/rest/v1/feedback", params={"user_id": f"eq.{uid}", "message_id": f"eq.{mid}"})
+        else:
+            sb("POST", "/rest/v1/feedback", params={"on_conflict": "user_id,message_id"},
+               corpo={"user_id": uid, "message_id": mid, "rating": voto},
+               extra={"Prefer": "resolution=merge-duplicates"})
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    return jsonify({"ok": True, "rating": voto})
+
+
+def _chat_dell_utente(uid, data):
+    """Restituisce (id_chat, errore): la chat deve esistere ed essere dell'utente."""
+    cid = id_valido(data.get("conversation_id"))
+    if not cid:
+        return None, errore("Chat non valida", 400)
+    righe = sb("GET", "/rest/v1/conversations", params={"id": f"eq.{cid}", "user_id": f"eq.{uid}", "select": "id"}).json()
+    if not righe:
+        return None, errore("Chat non trovata", 404)
+    return cid, None
+
+
+@app.route("/chats/share", methods=["POST"])
+def condividi_chat():
+    """Crea (o restituisce) il link di sola lettura di una chat dell'utente."""
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    consentita, attesa, _ = limite_link.controlla(utente["id"])
+    if not consentita:
+        return _troppe(attesa)
+    uid = utente["id"]
+    try:
+        cid, err = _chat_dell_utente(uid, _corpo_json())
+        if err:
+            return err
+        esistente = sb("GET", "/rest/v1/shared_chats", params={"conversation_id": f"eq.{cid}", "select": "token"}).json()
+        if esistente:
+            return jsonify({"token": esistente[0]["token"]})
+        token = secrets.token_urlsafe(12)
+        sb("POST", "/rest/v1/shared_chats", corpo={"token": token, "conversation_id": cid, "user_id": uid})
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    return jsonify({"token": token})
+
+
+@app.route("/chats/unshare", methods=["POST"])
+def smetti_di_condividere():
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    consentita, attesa, _ = limite_link.controlla(utente["id"])
+    if not consentita:
+        return _troppe(attesa)
+    uid = utente["id"]
+    try:
+        cid, err = _chat_dell_utente(uid, _corpo_json())
+        if err:
+            return err
+        sb("DELETE", "/rest/v1/shared_chats", params={"conversation_id": f"eq.{cid}", "user_id": f"eq.{uid}"})
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    return jsonify({"ok": True})
+
+
+TOKEN_LINK = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+@app.route("/shared/<token>", methods=["GET"])
+def chat_condivisa(token):
+    """Pubblica: mostra una chat condivisa. Niente email né dati dell'autore, solo titolo e messaggi."""
+    if not ACCOUNTS_ATTIVI:
+        return errore("Account non attivi", 404)
+    consentita, attesa, _ = limite_letture.controlla(request.remote_addr or "sconosciuto")
+    if not consentita:
+        return _troppe(attesa)
+    if not TOKEN_LINK.match(token):
+        return errore("Questo link non esiste o non è più condiviso.", 404)
+    try:
+        link = sb("GET", "/rest/v1/shared_chats", params={"token": f"eq.{token}", "select": "conversation_id"}).json()
+        if not link:
+            return errore("Questo link non esiste o non è più condiviso.", 404)
+        cid = link[0]["conversation_id"]
+        chat_riga = sb("GET", "/rest/v1/conversations", params={"id": f"eq.{cid}", "select": "title,created_at"}).json()
+        messaggi = sb("GET", "/rest/v1/messages", params={
+            "conversation_id": f"eq.{cid}", "order": "id.asc", "limit": 300,
+            "select": "role,content,created_at"}).json()
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    if not chat_riga:
+        return errore("Questo link non esiste o non è più condiviso.", 404)
+    resp = jsonify({"title": chat_riga[0].get("title"), "created_at": chat_riga[0].get("created_at"),
+                    "messages": messaggi})
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Robots-Tag"] = "noindex"
+    return resp
 
 
 # --- Utente: chi sono -----------------------------------------------------------
@@ -1248,6 +1500,25 @@ def admin_registro():
     except SupabaseNonDisponibile as e:
         return _errore_db(e)
     return jsonify({"log": righe})
+
+
+@app.route("/admin/feedback", methods=["GET"])
+def admin_feedback():
+    """Quante risposte hanno ricevuto 👍 e 👎, e le ultime con domanda e risposta."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        dati = rpc("admin_feedback_summary", {"p_limit": 60})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    if not isinstance(dati, dict):
+        return errore_admin("Risposta non valida dal database", 502)
+    for r in dati.get("recent") or []:
+        for campo in ("question", "answer"):
+            if isinstance(r.get(campo), str):
+                r[campo] = r[campo][:800]
+    return jsonify(dati)
 
 
 def _descrivi_impostazione(chiave, v):
