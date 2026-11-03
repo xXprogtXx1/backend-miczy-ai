@@ -812,7 +812,10 @@ def flusso_risposta(resp, uid, conversation_id, messages, messages_modello, rige
     "message_id": ...}; se qualcosa va storto {"error": "..."}. La chat si salva solo a risposta completa."""
     pezzi, uso = [], {}
     try:
-        for riga in resp.iter_lines(decode_unicode=True):
+        # Si leggono i byte e si decodifica qui in UTF-8: con decode_unicode "requests" userebbe
+        # Latin-1 (text/event-stream senza charset) e accenti ed emoji diventerebbero "PerchÃ©".
+        for riga in resp.iter_lines():
+            riga = riga.decode("utf-8", errors="replace") if isinstance(riga, bytes) else riga
             if not riga or not riga.startswith("data:"):
                 continue
             dato = riga[5:].strip()
