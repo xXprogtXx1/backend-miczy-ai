@@ -20,9 +20,17 @@ Tutte le impostazioni arrivano dalle variabili d'ambiente di Render, MAI dal cod
     GUEST_PER_DAY           messaggi al giorno per ospite (per IP), default 20
     USER_PER_DAY            messaggi al giorno per utente registrato, default 100
     SYSTEM_PROMPT           istruzioni fisse per l'IA
+    DISCORD_ADMIN_ALERTS    "0" per non ricevere su Discord gli avvisi (nuovo utente, sospensioni), default 1
+    PRICE_IN_PER_M          costo in dollari per milione di token in ingresso (stima costi), default 0.15
+    PRICE_OUT_PER_M         costo in dollari per milione di token in uscita, default 0.60
+
+  Dal pannello admin (salvate nel database, non servono variabili): modalità manutenzione,
+  avviso in cima al sito, limiti di messaggi, personalità del bot. Richiedono migrazione-admin.sql.
 """
 
+import copy
 import hashlib
+import json
 import os
 import threading
 import time
@@ -57,6 +65,18 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "800"))
 RATE_PER_MINUTE = int(os.environ.get("RATE_PER_MINUTE", "8"))
 GUEST_PER_DAY = int(os.environ.get("GUEST_PER_DAY", os.environ.get("RATE_PER_DAY", "20")))
 USER_PER_DAY = int(os.environ.get("USER_PER_DAY", "100"))
+
+
+def _numero(nome, predefinito):
+    try:
+        return float(os.environ.get(nome, predefinito))
+    except ValueError:
+        return float(predefinito)
+
+
+PRICE_IN_PER_M = _numero("PRICE_IN_PER_M", 0.15)    # dollari per milione di token (gpt-4o-mini)
+PRICE_OUT_PER_M = _numero("PRICE_OUT_PER_M", 0.60)
+DISCORD_ADMIN_ALERTS = os.environ.get("DISCORD_ADMIN_ALERTS", "1").strip().lower() not in ("0", "false", "no", "off")
 ALLOWED_ORIGINS = [
     o.strip().rstrip("/").lower()
     for o in os.environ.get("ALLOWED_ORIGINS", "").split(",")
@@ -243,7 +263,11 @@ def verifica_token(token):
     return utente
 
 
+_colonna_notifica = True  # diventa False se nel database manca profiles.notified_at (migrazione non fatta)
+
+
 def carica_profilo(uid, usa_cache=True):
+    global _colonna_notifica
     adesso = time.time()
     if usa_cache:
         with _cache_lock:
@@ -251,10 +275,18 @@ def carica_profilo(uid, usa_cache=True):
             if voce and voce[1] > adesso:
                 return voce[0]
 
-    r = sb("GET", "/rest/v1/profiles", params={
-        "id": f"eq.{uid}",
-        "select": "id,email,is_admin,banned_until,ban_reason,daily_limit",
-    })
+    campi = "id,email,is_admin,banned_until,ban_reason,daily_limit"
+    try:
+        r = sb("GET", "/rest/v1/profiles", params={
+            "id": f"eq.{uid}",
+            "select": campi + (",notified_at" if _colonna_notifica else ""),
+        })
+    except SupabaseNonDisponibile as e:
+        if _colonna_notifica and str(e) == "HTTP 400":  # colonna mancante: si va avanti senza avvisi
+            _colonna_notifica = False
+            app.logger.warning("Manca la colonna profiles.notified_at: esegui migrazione-admin.sql su Supabase.")
+            return carica_profilo(uid, usa_cache=False)
+        raise
     righe = r.json()
     profilo = righe[0] if righe else {"id": uid}
     with _cache_lock:
@@ -267,6 +299,14 @@ def carica_profilo(uid, usa_cache=True):
 def invalida_profilo(uid):
     with _cache_lock:
         _cache_profili.pop(uid, None)
+
+
+def dimentica_utente(uid):
+    """Dopo la cancellazione di un account: via dalle cache, anche i suoi token."""
+    with _cache_lock:
+        _cache_profili.pop(uid, None)
+        for k in [k for k, (u, _) in _cache_token.items() if u.get("id") == uid]:
+            _cache_token.pop(k, None)
 
 
 def _data(valore):
@@ -307,7 +347,217 @@ def messaggi_ultime_24h(uid):
 
 def limite_giornaliero(profilo):
     valore = profilo.get("daily_limit")
-    return int(valore) if isinstance(valore, int) and valore >= 0 else USER_PER_DAY
+    if isinstance(valore, int) and not isinstance(valore, bool) and valore >= 0:
+        return int(valore)
+    return impostazioni()["limits"].get("user_per_day", USER_PER_DAY)
+
+
+# --- Lavori in secondo piano, avvisi Discord, registro azioni ---------------------
+
+SYNC_BACKGROUND = False  # le prove automatiche lo mettono a True per avere risultati immediati
+_avvisi_dati = {}
+
+
+def in_background(funzione, *args):
+    """Esegue funzione(*args) senza far aspettare chi ha fatto la richiesta. Non solleva mai."""
+    def _lavoro():
+        try:
+            funzione(*args)
+        except Exception as e:  # un avviso o un log non devono mai rompere nulla
+            app.logger.warning("Lavoro in secondo piano non riuscito: %s", type(e).__name__)
+    if SYNC_BACKGROUND:
+        _lavoro()
+    else:
+        threading.Thread(target=_lavoro, daemon=True).start()
+
+
+def avvisa_una_volta(chiave, testo):
+    """Scrive un avviso nel log al massimo ogni 10 minuti (per non riempirlo)."""
+    adesso = time.time()
+    if adesso - _avvisi_dati.get(chiave, 0) > 600:
+        _avvisi_dati[chiave] = adesso
+        app.logger.warning(testo)
+
+
+def _per_discord(testo):
+    """Toglie i backtick (rovinerebbero il testo in codice) e gli a capo. Le menzioni (@everyone...)
+    sono già bloccate da allowed_mentions."""
+    return str(testo or "").replace("`", "'").replace("\n", " ")[:200]
+
+
+def avviso_admin(testo):
+    """Messaggio per l'admin sul canale Discord (nuovo utente, sospensione...)."""
+    if not (DISCORD_WEBHOOK_URL and DISCORD_ADMIN_ALERTS):
+        return
+
+    def _invia():
+        r = requests.post(DISCORD_WEBHOOK_URL,
+                          json={"content": testo[:1800], "allowed_mentions": {"parse": []}}, timeout=5)
+        if r.status_code >= 400:
+            app.logger.warning("Discord ha rifiutato l'avviso admin: HTTP %s", r.status_code)
+    in_background(_invia)
+
+
+def registra_azione(admin, azione, target_id=None, target_email=None, dettagli=None):
+    """Aggiunge una riga al registro delle azioni dell'admin (se la migrazione è stata fatta)."""
+    corpo = {"admin_id": admin.get("id"), "admin_email": admin.get("email"), "action": azione,
+             "target_id": target_id, "target_email": target_email, "details": (dettagli or "")[:300] or None}
+
+    def _scrivi():
+        try:
+            sb("POST", "/rest/v1/admin_log", corpo=corpo)
+        except SupabaseNonDisponibile as e:
+            avvisa_una_volta("admin_log", f"Registro azioni non scritto ({e}): hai eseguito migrazione-admin.sql?")
+    in_background(_scrivi)
+
+
+def avvisa_se_nuovo(profilo):
+    """Prima volta che un utente nuovo si fa vedere: avvisa l'admin su Discord, una volta sola."""
+    if not _colonna_notifica or "notified_at" not in profilo or profilo.get("notified_at"):
+        return
+    uid, email = profilo.get("id"), profilo.get("email")
+
+    def _lavoro():
+        # "is.null" nel filtro: se due richieste arrivano insieme, solo una vince e avvisa
+        r = sb("PATCH", "/rest/v1/profiles", params={"id": f"eq.{uid}", "notified_at": "is.null"},
+               corpo={"notified_at": datetime.now(timezone.utc).isoformat()},
+               extra={"Prefer": "return=representation"})
+        if r.json():
+            invalida_profilo(uid)
+            avviso_admin(f"🆕 **Nuovo utente su MiczyAI:** `{_per_discord(email)}`")
+    in_background(_lavoro)
+
+
+def registra_token(uid, tin, tout):
+    """Token usati da una risposta, per statistiche e costi. Anonimo per gli ospiti."""
+    try:
+        sb("POST", "/rest/v1/ai_usage", corpo={"user_id": uid, "kind": "user" if uid else "guest",
+                                               "tokens_in": tin, "tokens_out": tout})
+    except SupabaseNonDisponibile as e:
+        avvisa_una_volta("ai_usage", f"Token non registrati ({e}): hai eseguito migrazione-admin.sql?")
+
+
+def costo(tin, tout):
+    """Stima in dollari: i prezzi si regolano con PRICE_IN_PER_M e PRICE_OUT_PER_M."""
+    return round((tin or 0) / 1e6 * PRICE_IN_PER_M + (tout or 0) / 1e6 * PRICE_OUT_PER_M, 4)
+
+
+# --- Impostazioni del sito (si cambiano dal pannello admin) -------------------------
+
+PERSONALITA = {
+    "normale": ("Normale", ""),
+    "pirata": ("Pirata 🏴‍☠️", "Parla come un pirata: arrr, mozzo, tesori e mari in tempesta. Le informazioni "
+                              "devono restare corrette e utili."),
+    "professore": ("Professore", "Rispondi come un professore paziente e un po' teatrale: spiega passo passo, "
+                                 "con esempi e qualche battuta."),
+    "sarcastico": ("Sarcastico", "Sii sarcastico e ironico in modo leggero e mai offensivo, ma dai sempre "
+                                 "una risposta giusta e utile."),
+    "poeta": ("Poeta", "Rispondi in rima o con immagini poetiche, restando chiaro e corretto."),
+    "nonno": ("Nonno", "Parla come un nonno affettuoso che racconta aneddoti, chiama l'utente \"caro\" o "
+                       "\"cara\" e dà consigli pratici."),
+    "robot": ("Robot", "Parla come un robot dei vecchi film: frasi precise, qualche BEEP e una ogni tanto "
+                       "una piccola avaria comica."),
+    "brevissimo": ("Brevissimo", "Rispondi sempre in al massimo due frasi corte."),
+    "custom": ("Personalizzata", ""),  # il testo lo scrive l'admin
+}
+
+IMPOSTAZIONI_DEFAULT = {
+    "maintenance": {"on": False, "message": "Stiamo facendo un po' di manutenzione: torniamo tra poco!"},
+    "banner": {"on": False, "text": "", "kind": "info"},
+    "limits": {},
+    "personality": {"id": "normale", "custom": ""},
+}
+LIMITI_CAMPI = {"guest_per_day": (1, 100000), "user_per_day": (1, 100000), "per_minute": (1, 1000)}
+
+
+def normalizza_impostazione(chiave, v):
+    """Controlla un'impostazione. Restituisce (valore_pulito, errore)."""
+    if chiave not in IMPOSTAZIONI_DEFAULT:
+        return None, "Impostazione sconosciuta"
+    if not isinstance(v, dict):
+        return None, "Valore non valido"
+
+    if chiave == "maintenance":
+        on, msg = v.get("on"), v.get("message", "")
+        if not isinstance(on, bool) or not isinstance(msg, str):
+            return None, "Valore non valido"
+        return {"on": on, "message": msg.strip()[:300] or IMPOSTAZIONI_DEFAULT["maintenance"]["message"]}, None
+
+    if chiave == "banner":
+        on, testo, tipo = v.get("on"), v.get("text", ""), v.get("kind", "info")
+        if not isinstance(on, bool) or not isinstance(testo, str) or tipo not in ("info", "warn", "success"):
+            return None, "Valore non valido"
+        testo = testo.strip()[:300]
+        if on and not testo:
+            return None, "Scrivi il testo dell'avviso"
+        return {"on": on, "text": testo, "kind": tipo}, None
+
+    if chiave == "limits":
+        puliti = {}
+        for nome, (minimo, massimo) in LIMITI_CAMPI.items():
+            valore = v.get(nome)
+            if valore is None or valore == "":
+                continue
+            if isinstance(valore, bool) or not isinstance(valore, int) or not minimo <= valore <= massimo:
+                return None, f"'{nome}' deve essere un intero tra {minimo} e {massimo}"
+            puliti[nome] = valore
+        return puliti, None
+
+    # personality
+    scelta, custom = v.get("id"), v.get("custom", "")
+    if scelta not in PERSONALITA or not isinstance(custom, str):
+        return None, "Personalità non valida"
+    custom = custom.strip()[:500]
+    if scelta == "custom" and not custom:
+        return None, "Scrivi le istruzioni della personalità personalizzata"
+    return {"id": scelta, "custom": custom}, None
+
+
+_cache_impostazioni = {"valori": None, "scade": 0}
+
+
+def impostazioni(forza=False):
+    """Impostazioni correnti (cache di 15 secondi). Se il database non risponde si tiene l'ultimo valore
+    noto, così una breve interruzione non spegne per sbaglio la manutenzione."""
+    adesso = time.time()
+    with _cache_lock:
+        if not forza and _cache_impostazioni["valori"] is not None and _cache_impostazioni["scade"] > adesso:
+            return _cache_impostazioni["valori"]
+        precedenti = _cache_impostazioni["valori"]
+
+    valori, riuscito = copy.deepcopy(IMPOSTAZIONI_DEFAULT), False
+    if ACCOUNTS_ATTIVI:
+        try:
+            for riga in sb("GET", "/rest/v1/settings", params={"select": "key,value"}).json():
+                pulito, _ = normalizza_impostazione(riga.get("key"), riga.get("value"))
+                if pulito is not None:
+                    valori[riga["key"]] = pulito
+            riuscito = True
+        except Exception as e:  # le impostazioni non devono mai rompere la chat
+            avvisa_una_volta("settings", f"Impostazioni non lette ({type(e).__name__} {e}): hai eseguito "
+                                         "migrazione-admin.sql? Uso i valori predefiniti.")
+    else:
+        riuscito = True
+    if not riuscito and precedenti is not None:
+        valori = precedenti
+    with _cache_lock:
+        _cache_impostazioni["valori"] = valori
+        _cache_impostazioni["scade"] = adesso + (15 if riuscito else 5)
+    return valori
+
+
+def applica_limiti(imp):
+    """I limiti scelti dal pannello valgono al posto di quelli delle variabili d'ambiente."""
+    limiti = imp["limits"]
+    limite_ospiti.al_minuto = limiti.get("per_minute", RATE_PER_MINUTE)
+    limite_ospiti.al_giorno = limiti.get("guest_per_day", GUEST_PER_DAY)
+    limite_utenti.al_minuto = limiti.get("per_minute", RATE_PER_MINUTE)
+
+
+def prompt_di_sistema(imp):
+    p = imp["personality"]
+    testo = p["custom"] if p["id"] == "custom" else PERSONALITA.get(p["id"], ("", ""))[1]
+    return "\n\n".join(x for x in (SYSTEM_PROMPT, testo) if x)
 
 
 # --- Utilità -----------------------------------------------------------------
@@ -518,13 +768,20 @@ def chat():
             app.logger.warning("Supabase non disponibile: %s", e)
             return errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
 
-    # 2) Sospeso?
+    # 2) Manutenzione (gli admin possono continuare a usare il bot) e impostazioni scelte dal pannello
+    imp = impostazioni()
+    applica_limiti(imp)
+    if imp["maintenance"]["on"] and not profilo.get("is_admin"):
+        return errore(imp["maintenance"]["message"], 503)
+
+    # 3) Sospeso?
     if uid:
         fine = ban_attivo(profilo)
         if fine:
             return errore(testo_ban(profilo, fine), 403)
+        avvisa_se_nuovo(profilo)
 
-    # 3) Limiti
+    # 4) Limiti
     if uid:
         consentita, attesa, _ = limite_utenti.controlla(uid)
     else:
@@ -548,7 +805,7 @@ def chat():
             app.logger.warning("Supabase non disponibile: %s", e)
             return errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
 
-    # 4) Messaggi
+    # 5) Messaggi
     data = request.get_json(silent=True)
     messages, problema = pulisci_messaggi(data)
     if problema:
@@ -579,12 +836,13 @@ def chat():
     if DISCORD_AUTO_FORWARD and not rigenera:
         invia_a_discord(messages[-1]["content"])
 
-    if SYSTEM_PROMPT:
-        messages_modello = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    istruzioni = prompt_di_sistema(imp)
+    if istruzioni:
+        messages_modello = [{"role": "system", "content": istruzioni}] + messages
     else:
         messages_modello = messages
 
-    # 5) Il modello
+    # 6) Il modello
     try:
         resp = requests.post(
             OPENROUTER_URL,
@@ -596,9 +854,9 @@ def chat():
             timeout=(5, 45),  # connessione, lettura
         )
         resp.raise_for_status()
-        answer = (
-            resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        )
+        dati_ia = resp.json()
+        answer = dati_ia.get("choices", [{}])[0].get("message", {}).get("content", "")
+        uso = dati_ia.get("usage") if isinstance(dati_ia.get("usage"), dict) else {}
     except requests.Timeout:
         app.logger.warning("OpenRouter: timeout")
         return errore("L'IA ci sta mettendo troppo. Riprova tra poco.", 504)
@@ -622,7 +880,17 @@ def chat():
         app.logger.warning("OpenRouter: %s", type(e).__name__)
         return errore("Errore nella chiamata all'IA.", 502)
 
-    # 6) Salvataggio (solo utenti registrati)
+    # 7) Token usati (statistiche e costi); se OpenRouter non li dà si stimano dai caratteri
+    if ACCOUNTS_ATTIVI and answer:
+        tin = uso.get("prompt_tokens")
+        tout = uso.get("completion_tokens")
+        if not isinstance(tin, int):
+            tin = sum(len(m["content"]) for m in messages_modello) // 4
+        if not isinstance(tout, int):
+            tout = len(answer) // 4
+        in_background(registra_token, uid, tin, tout)
+
+    # 8) Salvataggio (solo utenti registrati)
     risultato = {"response": answer}
     if uid and answer:
         risultato["conversation_id"] = salva_chat(uid, conversation_id, messages, answer, rigenera)
@@ -650,6 +918,8 @@ def me():
         return errore_admin("Account non disponibili al momento", 503)
 
     fine = ban_attivo(profilo)
+    if not fine:
+        avvisa_se_nuovo(profilo)
     return jsonify({
         "id": utente["id"],
         "email": utente["email"],
@@ -759,6 +1029,11 @@ def admin_ban():
         return errore_admin("Database non disponibile", 503)
     invalida_profilo(uid)
     app.logger.info("ADMIN %s ha sospeso %s fino a %s", admin["id"], uid, fine.isoformat())
+    durata = "per sempre" if fine >= BAN_PERMANENTE - timedelta(days=1) \
+        else "fino al " + fine.astimezone(FUSO).strftime("%d/%m/%Y %H:%M")
+    registra_azione(admin, "ban", uid, profilo.get("email"), f"{durata}" + (f" - {motivo}" if motivo else ""))
+    avviso_admin(f"🚫 **Utente sospeso:** `{_per_discord(profilo.get('email'))}` ({durata})"
+                 + (f"\nMotivo: {_per_discord(motivo)}" if motivo else ""))
     return jsonify({"ok": True, "banned_until": fine.isoformat()})
 
 
@@ -767,7 +1042,7 @@ def admin_unban():
     admin, err = richiedi_admin()
     if err:
         return err
-    uid, _, err = _bersaglio(admin, _corpo_json())
+    uid, profilo, err = _bersaglio(admin, _corpo_json())
     if err:
         return err
     try:
@@ -777,6 +1052,7 @@ def admin_unban():
         return errore_admin("Database non disponibile", 503)
     invalida_profilo(uid)
     app.logger.info("ADMIN %s ha riattivato %s", admin["id"], uid)
+    registra_azione(admin, "unban", uid, profilo.get("email"))
     return jsonify({"ok": True})
 
 
@@ -787,7 +1063,7 @@ def admin_limite():
     if err:
         return err
     data = _corpo_json()
-    uid, _, err = _bersaglio(admin, data)
+    uid, profilo, err = _bersaglio(admin, data)
     if err:
         return err
 
@@ -801,6 +1077,8 @@ def admin_limite():
         return errore_admin("Database non disponibile", 503)
     invalida_profilo(uid)
     app.logger.info("ADMIN %s ha impostato il limite di %s a %s", admin["id"], uid, valore)
+    registra_azione(admin, "limit", uid, profilo.get("email"),
+                    "limite standard" if valore is None else f"{valore} messaggi / 24 ore")
     return jsonify({"ok": True, "daily_limit": valore})
 
 
@@ -824,6 +1102,236 @@ def admin_messaggi():
     except SupabaseNonDisponibile:
         return errore_admin("Database non disponibile", 503)
     return jsonify({"messages": righe})
+
+
+# --- Pannello admin: statistiche, ricerca, impostazioni, registro -----------------------
+
+def rpc(nome, corpo=None):
+    """Chiama una funzione SQL della migrazione. Restituisce il JSON (None se vuoto)."""
+    r = sb("POST", f"/rest/v1/rpc/{nome}", corpo=corpo or {})
+    try:
+        return r.json()
+    except ValueError:
+        return None
+
+
+def _errore_db(e):
+    if "HTTP 404" in str(e):  # funzione o tabella mancante
+        return errore_admin("Mancano le tabelle nuove: esegui migrazione-admin.sql nel SQL Editor di Supabase.", 503)
+    return errore_admin("Database non disponibile", 503)
+
+
+def _giorni(predefinito=30):
+    try:
+        return max(1, min(int(request.args.get("days", predefinito)), 365))
+    except ValueError:
+        return predefinito
+
+
+def _numeri(dati):
+    return dati if isinstance(dati, dict) else {}
+
+
+@app.route("/admin/overview", methods=["GET"])
+def admin_panoramica():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        dati = rpc("admin_overview")
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    if not isinstance(dati, dict):
+        return errore_admin("Risposta non valida dal database", 502)
+    t = _numeri(dati.get("tokens"))
+    dati["cost"] = {
+        "usd": {p: costo(t.get("in_" + p), t.get("out_" + p)) for p in ("24h", "7d", "30d", "total")},
+        "price_in_per_m": PRICE_IN_PER_M, "price_out_per_m": PRICE_OUT_PER_M,
+        "model": MODEL, "estimate": True,
+    }
+    return jsonify(dati)
+
+
+@app.route("/admin/daily", methods=["GET"])
+def admin_giornaliero():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        giorni = rpc("admin_daily", {"p_days": _giorni()})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    if not isinstance(giorni, list):
+        return errore_admin("Risposta non valida dal database", 502)
+    for g in giorni:
+        g["cost"] = costo(g.get("tokens_in"), g.get("tokens_out"))
+    return jsonify({"days": giorni})
+
+
+@app.route("/admin/heatmap", methods=["GET"])
+def admin_mappa():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        celle = rpc("admin_heatmap", {"p_days": _giorni()})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    return jsonify({"cells": celle if isinstance(celle, list) else []})
+
+
+@app.route("/admin/top", methods=["GET"])
+def admin_classifica():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        giorni = max(0, min(int(request.args.get("days", 30)), 3650))
+    except ValueError:
+        giorni = 30
+    try:
+        righe = rpc("admin_top", {"p_days": giorni, "p_limit": 10})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    return jsonify({"top": righe if isinstance(righe, list) else []})
+
+
+@app.route("/admin/random-message", methods=["GET"])
+def admin_domanda_strana():
+    """Una domanda a caso tra quelle di oggi: per il riquadro "domanda più strana del giorno"."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        ore = max(1, min(int(request.args.get("hours", 24)), 24 * 365))
+    except ValueError:
+        ore = 24
+    try:
+        riga = rpc("admin_random_message", {"p_hours": ore})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    return jsonify({"message": riga if isinstance(riga, dict) else None})
+
+
+@app.route("/admin/search", methods=["GET"])
+def admin_cerca():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    q = request.args.get("q", "").strip()[:100]
+    if len(q) < 2:
+        return errore_admin("Scrivi almeno 2 caratteri", 400)
+    try:
+        righe = rpc("admin_search_messages", {"p_q": q, "p_limit": 50})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    righe = righe if isinstance(righe, list) else []
+    for r in righe:
+        if isinstance(r.get("content"), str):
+            r["content"] = r["content"][:600]
+    return jsonify({"results": righe, "query": q})
+
+
+@app.route("/admin/log", methods=["GET"])
+def admin_registro():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        limite = max(1, min(int(request.args.get("limit", 100)), 300))
+    except ValueError:
+        limite = 100
+    try:
+        righe = sb("GET", "/rest/v1/admin_log", params={
+            "select": "id,admin_email,action,target_email,details,created_at",
+            "order": "id.desc", "limit": limite}).json()
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    return jsonify({"log": righe})
+
+
+def _descrivi_impostazione(chiave, v):
+    if chiave == "maintenance":
+        return "manutenzione " + ("attivata" if v["on"] else "disattivata")
+    if chiave == "banner":
+        return ("avviso acceso: " + v["text"][:80]) if v["on"] else "avviso spento"
+    if chiave == "limits":
+        return json.dumps(v, ensure_ascii=False) if v else "limiti standard"
+    return "personalità: " + v["id"]
+
+
+@app.route("/admin/settings", methods=["GET"])
+def admin_impostazioni():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    return jsonify({
+        "settings": impostazioni(forza=True),
+        "personalities": [{"id": k, "label": v[0]} for k, v in PERSONALITA.items()],
+        "defaults": {"guest_per_day": GUEST_PER_DAY, "user_per_day": USER_PER_DAY, "per_minute": RATE_PER_MINUTE},
+    })
+
+
+@app.route("/admin/settings", methods=["POST"])
+def admin_salva_impostazione():
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    data = _corpo_json()
+    chiave = data.get("key")
+    valore, problema = normalizza_impostazione(chiave, data.get("value"))
+    if problema:
+        return errore_admin(problema, 400)
+    try:
+        sb("POST", "/rest/v1/settings", params={"on_conflict": "key"},
+           corpo={"key": chiave, "value": valore, "updated_at": datetime.now(timezone.utc).isoformat()},
+           extra={"Prefer": "resolution=merge-duplicates"})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    registra_azione(admin, "settings:" + chiave, dettagli=_descrivi_impostazione(chiave, valore))
+    return jsonify({"ok": True, "settings": impostazioni(forza=True)})
+
+
+@app.route("/admin/delete-user", methods=["POST"])
+def admin_elimina_utente():
+    """Cancella un account e tutti i suoi dati (chat, messaggi, conteggi). Non si può annullare."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    data = _corpo_json()
+    uid, profilo, err = _bersaglio(admin, data)
+    if err:
+        return err
+    if uid == admin["id"] or profilo.get("is_admin"):
+        return errore_admin("Non puoi eliminare un admin (nemmeno te stesso)", 400)
+    email = (profilo.get("email") or "").strip()
+    atteso = (email or uid).lower()
+    if str(data.get("confirm_email") or "").strip().lower() != atteso:
+        return errore_admin("Per confermare scrivi l'email dell'utente", 400)
+    try:
+        rpc("admin_delete_user", {"p_id": uid})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    dimentica_utente(uid)
+    app.logger.info("ADMIN %s ha eliminato l'account %s", admin["id"], uid)
+    registra_azione(admin, "delete_user", uid, email or None, "account e dati cancellati")
+    avviso_admin(f"🗑️ **Account eliminato:** `{_per_discord(email or uid)}`")
+    return jsonify({"ok": True})
+
+
+# --- Stato pubblico del sito ---------------------------------------------------------
+
+@app.route("/status", methods=["GET"])
+def stato_sito():
+    """Letto da ogni pagina del sito: avviso in cima e modalità manutenzione."""
+    imp = impostazioni()
+    m, b = imp["maintenance"], imp["banner"]
+    resp = jsonify({
+        "maintenance": {"on": m["on"], "message": m["message"]},
+        "banner": {"on": bool(b["on"] and b["text"]), "text": b["text"], "kind": b["kind"]},
+    })
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 # --- Salute --------------------------------------------------------------------
