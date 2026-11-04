@@ -187,12 +187,27 @@ class LimitatoreRichieste:
             return True, 0, ""
 
 
+    def stato(self, chiave):
+        """Quante richieste al giorno ha già fatto questa chiave, senza registrarne una nuova.
+        Restituisce (usate, massimo, secondi_al_rinnovo)."""
+        adesso = time.time()
+        with self._lock:
+            g = self._giorno.get(chiave)
+            if g is None:
+                return 0, self.al_giorno, 0
+            while g and adesso - g[0] > 86400:
+                g.popleft()
+            return len(g), self.al_giorno, (int(86400 - (adesso - g[0])) + 1 if g else 0)
+
+
 limite_ospiti = LimitatoreRichieste(RATE_PER_MINUTE, GUEST_PER_DAY)
 limite_utenti = LimitatoreRichieste(RATE_PER_MINUTE, 10**9)  # solo "al minuto"
-limite_condivisioni = LimitatoreRichieste(5, 3600)  # pulsante "Invia su Discord": per utente, 5 all'ora
+limite_condivisioni = LimitatoreRichieste(2, 10)  # pulsante "Invia su Discord": per utente, 2 al minuto e 10 al giorno
 limite_feedback = LimitatoreRichieste(30, 2000)   # pollice su/giù: per utente
 limite_link = LimitatoreRichieste(10, 200)        # creare/revocare link di condivisione: per utente
 limite_letture = LimitatoreRichieste(30, 3000)    # aprire un link condiviso: per IP
+limite_quota = LimitatoreRichieste(30, 3000)      # contatore messaggi degli ospiti: per IP
+limite_importazioni = LimitatoreRichieste(2, 5)   # salvare nell'account la chat fatta da ospite: per utente
 
 
 # --- Supabase -------------------------------------------------------------------
@@ -690,7 +705,7 @@ def condividi():
         for ruolo, testo in (("user", domanda), ("assistant", risposta)):
             r = sb("GET", "/rest/v1/messages", params={
                 "user_id": f"eq.{utente['id']}", "role": f"eq.{ruolo}", "content": f"eq.{testo}",
-                "select": "id", "limit": "1"})
+                "imported": "eq.false", "select": "id", "limit": "1"})
             if not r.json():
                 app.logger.warning("Condivisione rifiutata: testo non presente nelle chat di %s", utente["id"][:8])
                 return errore("Puoi inviare solo messaggi delle tue chat salvate.", 403)
@@ -1075,6 +1090,84 @@ def _chat_dell_utente(uid, data):
     if not righe:
         return None, errore("Chat non trovata", 404)
     return cid, None
+
+
+@app.route("/quota", methods=["GET"])
+def quota_ospite():
+    """Quanti messaggi gratuiti restano a un ospite oggi (non ne consuma nessuno)."""
+    consentita, attesa, _ = limite_quota.controlla(request.remote_addr or "sconosciuto")
+    if not consentita:
+        return _troppe(attesa)
+    if token_della_richiesta() and ACCOUNTS_ATTIVI:
+        return jsonify({"guest": False})
+    applica_limiti(impostazioni())
+    usati, massimo, rinnovo = limite_ospiti.stato(request.remote_addr or "sconosciuto")
+    return jsonify({"guest": True, "remaining": max(0, massimo - usati), "limit": massimo, "reset": rinnovo})
+
+
+MAX_IMPORT_MESSAGGI = 40
+MAX_IMPORT_CARATTERI = 60000
+
+
+@app.route("/chats/import", methods=["POST"])
+def importa_chat():
+    """Salva nell'account la conversazione fatta da ospite. I messaggi importati vengono marcati:
+    il browser può scrivere ciò che vuole, quindi non valgono come "risposte vere" (es. per Discord)."""
+    utente, rifiuto = richiedi_utente()
+    if rifiuto:
+        return rifiuto
+    uid = utente["id"]
+    try:
+        profilo = carica_profilo(uid)
+        fine = ban_attivo(profilo)
+        if fine:
+            return errore(testo_ban(profilo, fine), 403)
+    except SupabaseNonDisponibile as e:
+        app.logger.warning("Supabase non disponibile: %s", e)
+        return errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
+
+    consentita, attesa, _ = limite_importazioni.controlla(uid)
+    if not consentita:
+        return _troppe(attesa)
+
+    data = request.get_json(silent=True)
+    grezzi = data.get("messages") if isinstance(data, dict) else None
+    if not isinstance(grezzi, list) or not (2 <= len(grezzi) <= MAX_IMPORT_MESSAGGI):
+        return errore("Conversazione non valida.", 400)
+    messaggi, totale = [], 0
+    for m in grezzi:
+        if not (isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)):
+            return errore("Conversazione non valida.", 400)
+        testo = m["content"].strip()
+        if not testo or len(testo) > MAX_CHARS_TOTAL:
+            return errore("Conversazione non valida.", 400)
+        totale += len(testo)
+        messaggi.append({"role": m["role"], "content": testo})
+    if totale > MAX_IMPORT_CARATTERI or messaggi[0]["role"] != "user" or not any(m["role"] == "assistant" for m in messaggi):
+        return errore("Conversazione non valida.", 400)
+
+    conversation_id = None
+    try:
+        titolo = messaggi[0]["content"].replace("\n", " ")[:60] or "Nuova chat"
+        r = sb("POST", "/rest/v1/conversations", corpo={"user_id": uid, "title": titolo},
+               extra={"Prefer": "return=representation"})
+        conversation_id = r.json()[0]["id"]
+        righe = [{"conversation_id": conversation_id, "user_id": uid, "role": m["role"],
+                  "content": m["content"], "imported": True} for m in messaggi]
+        sb("POST", "/rest/v1/messages", corpo=righe)
+        sb("PATCH", "/rest/v1/conversations", params={"id": f"eq.{conversation_id}"},
+           corpo={"updated_at": datetime.now(timezone.utc).isoformat()})
+    except (SupabaseNonDisponibile, KeyError, IndexError, ValueError) as e:
+        app.logger.warning("Importazione chat non riuscita: %s", e)
+        if conversation_id:  # niente chat vuote a metà
+            try:
+                sb("DELETE", "/rest/v1/conversations", params={"id": f"eq.{conversation_id}"})
+            except SupabaseNonDisponibile:
+                pass
+        if "imported" in str(e) or "HTTP 400" in str(e):
+            app.logger.warning("Hai eseguito migrazione-ospite.sql su Supabase?")
+        return errore("Non sono riuscito a salvare la chat. Riprova più tardi.", 503)
+    return jsonify({"conversation_id": conversation_id, "count": len(messaggi)})
 
 
 @app.route("/chats/share", methods=["POST"])
