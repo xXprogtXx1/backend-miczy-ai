@@ -529,6 +529,13 @@ def applica_limiti(imp):
     limite_utenti.al_minuto = limiti.get("per_minute", RATE_PER_MINUTE)
 
 
+# Lunghezza della risposta scelta dall'utente nelle impostazioni: (istruzione per l'IA, token massimi)
+LUNGHEZZE = {
+    "breve": ("Keep every answer very short: two or three sentences at most.", lambda m: min(m, 300)),
+    "lunga": ("Give thorough, detailed answers, with examples when they help.", lambda m: min(m * 2, 2000)),
+}
+
+
 def prompt_di_sistema(imp):
     p = imp["personality"]
     testo = p["custom"] if p["id"] == "custom" else PERSONALITA.get(p["id"], ("", ""))[1]
@@ -917,6 +924,13 @@ def chat():
         invia_a_discord(messages[-1]["content"])
 
     istruzioni = prompt_di_sistema(imp)
+    max_token = MAX_TOKENS
+    # la lunghezza è un'impostazione degli account: dagli ospiti viene ignorata
+    scelta = data.get("length") if uid and isinstance(data.get("length"), str) else None
+    if scelta in LUNGHEZZE:
+        suggerimento, calcola = LUNGHEZZE[scelta]
+        istruzioni = "\n\n".join(x for x in (istruzioni, suggerimento) if x)
+        max_token = calcola(MAX_TOKENS)
     if istruzioni:
         messages_modello = [{"role": "system", "content": istruzioni}] + messages
     else:
@@ -925,7 +939,7 @@ def chat():
     # 6) Il modello (risposta intera, oppure a poco a poco se il sito lo chiede con "stream": true)
     in_streaming = data.get("stream") is True
     try:
-        corpo_ia = {"model": MODEL, "messages": messages_modello, "max_tokens": MAX_TOKENS}
+        corpo_ia = {"model": MODEL, "messages": messages_modello, "max_tokens": max_token}
         extra_richiesta = {}
         if in_streaming:
             corpo_ia.update(stream=True, stream_options={"include_usage": True})
@@ -994,7 +1008,7 @@ def _troppe(attesa):
 
 def _manca_migrazione(e):
     if "HTTP 404" in str(e):
-        app.logger.warning("Tabella mancante (%s): hai eseguito migrazione-chat.sql su Supabase?", e)
+        app.logger.warning("Tabella mancante (%s): hai eseguito i file .sql di migrazione su Supabase?", e)
         return errore("Questa funzione non è ancora attiva. Riprova più tardi.", 503)
     return errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
 
@@ -1552,6 +1566,167 @@ def admin_elimina_utente():
     dimentica_utente(uid)
     app.logger.info("ADMIN %s ha eliminato l'account %s", admin["id"], uid)
     registra_azione(admin, "delete_user", uid, email or None, "account e dati cancellati")
+    return jsonify({"ok": True})
+
+
+# --- Cancellazione dell'account: l'utente chiede (con un motivo), l'admin decide ------------
+
+limite_account = LimitatoreRichieste(10, 60)   # richieste su /account/*: per utente
+
+
+def _motivo_pulito(valore):
+    """Il motivo scritto dall'utente: testo semplice, 3-500 caratteri. None se non va bene."""
+    if not isinstance(valore, str):
+        return None
+    testo = " ".join(valore.split())
+    return testo if 3 <= len(testo) <= 500 else None
+
+
+def _richiesta_pubblica(r):
+    return {"id": r.get("id"), "status": r.get("status"), "reason": r.get("reason"),
+            "admin_note": r.get("admin_note"), "created_at": r.get("created_at"),
+            "decided_at": r.get("decided_at")}
+
+
+def _ultima_richiesta(uid):
+    righe = sb("GET", "/rest/v1/deletion_requests", params={
+        "user_id": f"eq.{uid}", "order": "created_at.desc", "limit": 1, "select": "*"}).json()
+    return righe[0] if righe else None
+
+
+@app.route("/account/delete-request", methods=["GET", "POST"])
+def richiesta_cancellazione():
+    """GET: com'è l'ultima richiesta. POST {reason}: chiede di eliminare il proprio account (decide l'admin)."""
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    consentita, attesa, _ = limite_account.controlla(utente["id"])
+    if not consentita:
+        return _troppe(attesa)
+    uid = utente["id"]
+    try:
+        if request.method == "GET":
+            r = _ultima_richiesta(uid)
+            return jsonify({"request": _richiesta_pubblica(r) if r else None})
+
+        motivo = _motivo_pulito(_corpo_json().get("reason"))
+        if not motivo:
+            return errore("Scrivi il motivo (da 3 a 500 caratteri).", 400)
+        profilo = carica_profilo(uid, usa_cache=False)
+        if profilo.get("is_admin"):
+            return errore("Un account admin non può essere eliminato da qui.", 400)
+        ultima = _ultima_richiesta(uid)
+        if ultima and ultima.get("status") == "pending":
+            return errore("Hai già una richiesta in attesa.", 409)
+        try:
+            nuova = sb("POST", "/rest/v1/deletion_requests",
+                       corpo={"user_id": uid, "email": utente.get("email"), "reason": motivo},
+                       extra={"Prefer": "return=representation"}).json()
+        except SupabaseNonDisponibile as e:
+            if "HTTP 409" in str(e):   # due richieste insieme: vince la prima
+                return errore("Hai già una richiesta in attesa.", 409)
+            raise
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    app.logger.info("Richiesta di cancellazione account %s", uid)
+    return jsonify({"ok": True, "request": _richiesta_pubblica(nuova[0] if nuova else {"status": "pending"})})
+
+
+@app.route("/account/delete-request/cancel", methods=["POST"])
+def annulla_richiesta_cancellazione():
+    """L'utente ci ripensa: ritira la richiesta ancora in attesa."""
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    consentita, attesa, _ = limite_account.controlla(utente["id"])
+    if not consentita:
+        return _troppe(attesa)
+    try:
+        r = sb("PATCH", "/rest/v1/deletion_requests",
+               params={"user_id": f"eq.{utente['id']}", "status": "eq.pending"},
+               corpo={"status": "cancelled", "decided_at": datetime.now(timezone.utc).isoformat()},
+               extra={"Prefer": "return=representation"}).json()
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    if not r:
+        return errore("Non c'è nessuna richiesta in attesa.", 404)
+    return jsonify({"ok": True})
+
+
+@app.route("/admin/deletion-requests", methods=["GET"])
+def admin_richieste_cancellazione():
+    """Richieste in attesa (tutte) e ultime già decise."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    try:
+        attesa = sb("GET", "/rest/v1/deletion_requests", params={
+            "status": "eq.pending", "order": "created_at.asc", "limit": 100, "select": "*"}).json()
+        decise = sb("GET", "/rest/v1/deletion_requests", params={
+            "status": "neq.pending", "order": "created_at.desc", "limit": 30, "select": "*"}).json()
+    except SupabaseNonDisponibile as e:
+        if "HTTP 404" in str(e):
+            return errore_admin("Manca la tabella: esegui migrazione-impostazioni.sql nel SQL Editor di Supabase.", 503)
+        return errore_admin("Database non disponibile", 503)
+    return jsonify({"pending": attesa, "decided": decise})
+
+
+@app.route("/admin/deletion-requests/decide", methods=["POST"])
+def admin_decidi_cancellazione():
+    """Approva (e cancella davvero l'account) o rifiuta una richiesta."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    data = _corpo_json()
+    rid, approva = data.get("id"), data.get("approve")
+    if isinstance(rid, bool) or not isinstance(rid, int) or not 0 < rid < 2**62:
+        return errore_admin("Richiesta non valida", 400)
+    if not isinstance(approva, bool):
+        return errore_admin("Serve approve: true o false", 400)
+    nota = data.get("note")
+    nota = " ".join(nota.split())[:300] if isinstance(nota, str) and nota.strip() else None
+    adesso = datetime.now(timezone.utc).isoformat()
+    try:
+        righe = sb("GET", "/rest/v1/deletion_requests", params={"id": f"eq.{rid}", "select": "*"}).json()
+        if not righe:
+            return errore_admin("Richiesta non trovata", 404)
+        r = righe[0]
+        if r.get("status") != "pending":
+            return errore_admin("Questa richiesta è già stata gestita", 409)
+        uid, email = r.get("user_id"), (r.get("email") or "").strip()
+
+        if approva:
+            if not uid:
+                return errore_admin("L'account non esiste più", 409)
+            profilo = carica_profilo(uid, usa_cache=False)
+            if profilo.get("is_admin") or uid == admin["id"]:
+                return errore_admin("Non puoi eliminare un admin (nemmeno te stesso)", 400)
+            atteso = (email or uid).lower()
+            if str(data.get("confirm_email") or "").strip().lower() != atteso:
+                return errore_admin("Per confermare scrivi l'email dell'utente", 400)
+
+        # si segna la decisione per prima: se due admin cliccano insieme, solo uno procede
+        esito = sb("PATCH", "/rest/v1/deletion_requests", params={"id": f"eq.{rid}", "status": "eq.pending"},
+                   corpo={"status": "approved" if approva else "rejected", "admin_note": nota,
+                          "decided_at": adesso, "decided_by": admin.get("email")},
+                   extra={"Prefer": "return=representation"}).json()
+        if not esito:
+            return errore_admin("Questa richiesta è già stata gestita", 409)
+
+        if approva:
+            try:
+                rpc("admin_delete_user", {"p_id": uid})
+            except SupabaseNonDisponibile:
+                sb("PATCH", "/rest/v1/deletion_requests", params={"id": f"eq.{rid}"},
+                   corpo={"status": "pending", "decided_at": None, "decided_by": None})   # non è successo niente
+                raise
+            dimentica_utente(uid)
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    registra_azione(admin, "deletion_approved" if approva else "deletion_rejected", uid, email or None,
+                    (nota or "") or None)
+    app.logger.info("ADMIN %s ha %s la richiesta di cancellazione %s", admin["id"],
+                    "approvato" if approva else "rifiutato", rid)
     return jsonify({"ok": True})
 
 
