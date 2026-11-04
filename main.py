@@ -59,9 +59,10 @@ app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # corpo della richiesta: max 64 KB
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-# "1" (predefinito): ogni domanda viene inoltrata a Discord in automatico, come prima.
-# "0": non si inoltra più nulla da sé; arriva su Discord solo ciò che l'utente invia col pulsante.
-DISCORD_AUTO_FORWARD = os.environ.get("DISCORD_AUTO_FORWARD", "1").strip().lower() not in ("0", "false", "no", "off")
+# "0" (predefinito, più sicuro): non si inoltra nulla da sé; su Discord arriva solo ciò che un utente
+#     registrato invia col pulsante.
+# "1": ogni domanda viene inoltrata a Discord in automatico (chiunque potrebbe farci arrivare testo).
+DISCORD_AUTO_FORWARD = os.environ.get("DISCORD_AUTO_FORWARD", "0").strip().lower() not in ("0", "false", "no", "off")
 MODEL = os.environ.get("MODEL", "gpt-4o-mini")
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "800"))
@@ -188,7 +189,7 @@ class LimitatoreRichieste:
 
 limite_ospiti = LimitatoreRichieste(RATE_PER_MINUTE, GUEST_PER_DAY)
 limite_utenti = LimitatoreRichieste(RATE_PER_MINUTE, 10**9)  # solo "al minuto"
-limite_condivisioni = LimitatoreRichieste(3, 15)  # pulsante "Invia su Discord": per IP, anti-spam
+limite_condivisioni = LimitatoreRichieste(5, 3600)  # pulsante "Invia su Discord": per utente, 5 all'ora
 limite_feedback = LimitatoreRichieste(30, 2000)   # pollice su/giù: per utente
 limite_link = LimitatoreRichieste(10, 200)        # creare/revocare link di condivisione: per utente
 limite_letture = LimitatoreRichieste(30, 3000)    # aprire un link condiviso: per IP
@@ -660,11 +661,17 @@ def costruisci_embed(domanda, risposta):
 
 @app.route("/share", methods=["POST"])
 def condividi():
-    """Pulsante "Invia su Discord": l'utente sceglie di mandare una domanda e la sua risposta."""
+    """Pulsante "Invia su Discord". Solo per utenti registrati, e solo per testi che esistono davvero
+    nelle loro chat salvate: così nessuno può usare questo indirizzo per scrivere testo a piacere
+    nel canale Discord."""
     if not DISCORD_WEBHOOK_URL:
         return errore("L'invio su Discord non è attivo.", 503)
 
-    consentita, attesa, _ = limite_condivisioni.controlla(request.remote_addr or "sconosciuto")
+    utente, rifiuto = richiedi_utente()
+    if rifiuto:
+        return rifiuto
+
+    consentita, attesa, _ = limite_condivisioni.controlla(utente["id"])
     if not consentita:
         resp, codice = errore("Hai inviato troppe volte: riprova più tardi.", 429)
         resp.headers["Retry-After"] = str(attesa)
@@ -676,14 +683,27 @@ def condividi():
     domanda, risposta = data.get("question"), data.get("answer")
     if not (isinstance(domanda, str) and isinstance(risposta, str) and domanda.strip() and risposta.strip()):
         return errore("Domanda o risposta mancante.", 400)
+    domanda, risposta = domanda.strip()[:MAX_CHARS_MESSAGE], risposta.strip()[:MAX_CHARS_TOTAL]
 
+    # i due testi devono essere messaggi salvati di questo utente (la domanda sua, la risposta del bot)
+    try:
+        for ruolo, testo in (("user", domanda), ("assistant", risposta)):
+            r = sb("GET", "/rest/v1/messages", params={
+                "user_id": f"eq.{utente['id']}", "role": f"eq.{ruolo}", "content": f"eq.{testo}",
+                "select": "id", "limit": "1"})
+            if not r.json():
+                app.logger.warning("Condivisione rifiutata: testo non presente nelle chat di %s", utente["id"][:8])
+                return errore("Puoi inviare solo messaggi delle tue chat salvate.", 403)
+    except SupabaseNonDisponibile as e:
+        app.logger.warning("Supabase non disponibile: %s", e)
+        return errore("Gli account non sono disponibili al momento. Riprova tra poco.", 503)
+
+    embeds = costruisci_embed(domanda, risposta)
+    embeds[0]["footer"] = {"text": "Inviata con il pulsante \"Invia su Discord\" da " + str(utente.get("email") or utente["id"])[:80]}
     try:
         r = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={
-                "embeds": costruisci_embed(domanda[:MAX_CHARS_MESSAGE], risposta[:MAX_CHARS_TOTAL]),
-                "allowed_mentions": {"parse": []},  # niente @everyone / @here
-            },
+            json={"embeds": embeds, "allowed_mentions": {"parse": []}},  # niente @everyone / @here
             timeout=5,
         )
         r.raise_for_status()
