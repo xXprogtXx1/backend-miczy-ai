@@ -206,6 +206,7 @@ limite_condivisioni = LimitatoreRichieste(2, 10)  # pulsante "Invia su Discord":
 limite_feedback = LimitatoreRichieste(30, 2000)   # pollice su/giù: per utente
 limite_link = LimitatoreRichieste(10, 200)        # creare/revocare link di condivisione: per utente
 limite_letture = LimitatoreRichieste(30, 3000)    # aprire un link condiviso: per IP
+limite_health = LimitatoreRichieste(60, 5000)     # sveglia del server all'apertura del sito: per IP
 limite_quota = LimitatoreRichieste(30, 3000)      # contatore messaggi degli ospiti: per IP
 limite_importazioni = LimitatoreRichieste(2, 5)   # salvare nell'account la chat fatta da ospite: per utente
 
@@ -1844,6 +1845,18 @@ def admin_decidi_cancellazione():
 
 
 # --- Stato pubblico del sito ---------------------------------------------------------
+
+@app.route("/health", methods=["GET", "HEAD"])
+def salute():
+    """Leggerissimo: il sito lo chiama appena si apre, così Render si sveglia mentre l'utente legge.
+    Non tocca il database e non richiede l'accesso."""
+    consentita, attesa, _ = limite_health.controlla(request.remote_addr or "sconosciuto")
+    if not consentita:
+        return _troppe(attesa)
+    resp = jsonify({"ok": True})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 
 @app.route("/status", methods=["GET"])
 def stato_sito():
