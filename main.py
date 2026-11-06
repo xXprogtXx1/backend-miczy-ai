@@ -1596,6 +1596,39 @@ def admin_registro():
     return jsonify({"log": righe})
 
 
+@app.route("/admin/access", methods=["GET"])
+def admin_access():
+    """Elenco degli utenti per ultimo accesso (data, browser, sessioni). Mai l'IP."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    q = (request.args.get("q") or "").strip()[:100]
+    try:
+        limite = max(1, min(int(request.args.get("limit", "100")), 200))
+    except ValueError:
+        limite = 100
+    try:
+        dati = rpc("admin_access_list", {"p_limit": limite, "p_query": q})
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    if not isinstance(dati, list):
+        return errore_admin("Risposta non valida dal database", 502)
+    utenti = []
+    for r in dati:
+        if not isinstance(r, dict):
+            continue
+        ua = r.get("user_agent")
+        utenti.append({
+            "id": r.get("id"),
+            "email": r.get("email"),
+            "created_at": r.get("created_at"),
+            "last_sign_in_at": r.get("last_sign_in_at"),
+            "sessions": r.get("sessions") or 0,
+            "user_agent": ua[:300] if isinstance(ua, str) else None,
+        })
+    return jsonify({"users": utenti})
+
+
 @app.route("/admin/feedback", methods=["GET"])
 def admin_feedback():
     """Quante risposte hanno ricevuto 👍 e 👎, e le ultime con domanda e risposta."""
