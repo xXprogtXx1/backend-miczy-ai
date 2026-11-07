@@ -1941,18 +1941,19 @@ def _testo_ticket(valore, minimo, massimo, una_riga):
     return pulito if minimo <= len(pulito) <= massimo else None
 
 
-def html_email_ticket(numero, da, categoria, oggetto, messaggio):
+def html_email_ticket(numero, da, categoria, oggetto, messaggio, nuovo=True):
     """Versione grafica dell'email di avviso. Tutto il testo dell'utente passa da html.escape."""
     e = lambda v: html.escape(str(v or ""), quote=True)
     nomi = {"account": "Account e accesso", "chat": "Chat e risposte", "bug": "Qualcosa non funziona", "idea": "Un'idea", "altro": "Altro"}
     msg = e(messaggio).replace("\n", "<br>")
+    titolo = "Nuovo ticket" if nuovo else "Nuova risposta al ticket"
     bottone = ""
     if SITE_URL.startswith("https://"):
         bottone = ('<tr><td align="center" style="padding:6px 0 22px"><a href="' + e(SITE_URL) + '/admin/" style="display:inline-block;'
                    'background:#ff5aa5;color:#17131f;font:800 16px Arial,Helvetica,sans-serif;text-decoration:none;padding:13px 26px;'
                    'border:3px solid #17131f;border-radius:999px;box-shadow:4px 4px 0 #17131f">Apri i ticket</a></td></tr>')
     return f'''<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light only"><title>Nuovo ticket #{e(numero)}</title></head>
+<meta name="color-scheme" content="light only"><title>{titolo} #{e(numero)}</title></head>
 <body style="margin:0;padding:0;background:#fff3c4" bgcolor="#fff3c4">
 <div style="display:none;max-height:0;overflow:hidden;opacity:0">{e(oggetto)}</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#fff3c4"><tr><td align="center" style="padding:28px 14px">
@@ -1960,7 +1961,7 @@ def html_email_ticket(numero, da, categoria, oggetto, messaggio):
 <tr><td align="center" style="padding:0 0 16px;font:900 28px Arial Black,Arial,Helvetica,sans-serif;color:#17131f;letter-spacing:-1px">Miczy<span style="background:#ff5aa5;padding:0 6px;border-radius:8px">AI</span></td></tr>
 <tr><td bgcolor="#ffffff" style="background:#ffffff;border:3px solid #17131f;border-radius:22px;box-shadow:6px 6px 0 #17131f">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-<tr><td bgcolor="#ffd93d" style="background:#ffd93d;border-bottom:3px solid #17131f;border-radius:19px 19px 0 0;padding:16px 24px;font:800 14px Arial,Helvetica,sans-serif;color:#17131f">🎫&nbsp; Nuovo ticket #{e(numero)}</td></tr>
+<tr><td bgcolor="#ffd93d" style="background:#ffd93d;border-bottom:3px solid #17131f;border-radius:19px 19px 0 0;padding:16px 24px;font:800 14px Arial,Helvetica,sans-serif;color:#17131f">🎫&nbsp; {titolo} #{e(numero)}</td></tr>
 <tr><td style="padding:24px 26px 8px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">
 <tr><td style="font:900 22px/1.25 Arial,Helvetica,sans-serif;color:#17131f;padding:0 0 12px">{e(oggetto)}</td></tr>
 <tr><td style="padding:0 0 16px"><span style="display:inline-block;background:#e9e2ff;border:2px solid #17131f;border-radius:999px;padding:3px 12px;font:800 12px Arial,Helvetica,sans-serif;color:#17131f">{e(nomi.get(categoria, "Altro"))}</span>
@@ -1996,10 +1997,25 @@ def invia_email_assistenza(oggetto, testo, rispondi_a=None, html_corpo=None):
     in_background(_invia)
 
 
-def _ticket_pubblico(t):
+def _ticket_pubblico(t, messaggi=None):
     return {"id": t.get("id"), "category": t.get("category"), "subject": t.get("subject"),
-            "message": t.get("message"), "status": t.get("status"), "reply": t.get("reply"),
-            "replied_at": t.get("replied_at"), "created_at": t.get("created_at")}
+            "message": t.get("message"), "status": t.get("status"), "last_author": t.get("last_author") or "user",
+            "created_at": t.get("created_at"),
+            "messages": [{"id": m.get("id"), "author": m.get("author"), "body": m.get("body"),
+                          "created_at": m.get("created_at")} for m in (messaggi or [])]}
+
+
+def _messaggi_dei_ticket(ids):
+    """Le conversazioni dei ticket indicati: {ticket_id: [messaggi in ordine]}."""
+    per_ticket = defaultdict(list)
+    if not ids:
+        return per_ticket
+    righe = sb("GET", "/rest/v1/ticket_messages", params={
+        "ticket_id": "in.(" + ",".join(str(int(i)) for i in ids) + ")", "order": "id.asc", "limit": 2000,
+        "select": "id,ticket_id,author,body,created_at,author_email"}).json()
+    for m in righe:
+        per_ticket[m.get("ticket_id")].append(m)
+    return per_ticket
 
 
 @app.route("/tickets", methods=["GET", "POST"])
@@ -2017,7 +2033,8 @@ def ticket_utente():
         if request.method == "GET":
             righe = sb("GET", "/rest/v1/tickets", params={
                 "user_id": f"eq.{uid}", "order": "created_at.desc", "limit": 20, "select": "*"}).json()
-            return jsonify({"tickets": [_ticket_pubblico(t) for t in righe]})
+            conv = _messaggi_dei_ticket([t.get("id") for t in righe])
+            return jsonify({"tickets": [_ticket_pubblico(t, conv.get(t.get("id"))) for t in righe]})
 
         dati = _corpo_json()
         oggetto = _testo_ticket(dati.get("subject"), 3, 100, True)
@@ -2048,6 +2065,50 @@ def ticket_utente():
     return jsonify({"ok": True, "ticket": _ticket_pubblico(t)})
 
 
+limite_ticket_msg = LimitatoreRichieste(6, 60)   # risposte dell'utente a un ticket: per utente
+MAX_MESSAGGI_TICKET = 100
+
+
+@app.route("/tickets/<int:tid>/messages", methods=["POST"])
+def ticket_rispondi(tid):
+    """L'utente risponde al proprio ticket, finché è aperto. Corpo: {body}."""
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    uid = utente["id"]
+    consentita, attesa, _ = limite_ticket_msg.controlla(uid)
+    if not consentita:
+        return _troppe(attesa)
+    testo = _testo_ticket(_corpo_json().get("body"), 1, 2000, False)
+    if not testo:
+        return errore("Scrivi un messaggio (massimo 2000 caratteri).", 400)
+    try:
+        righe = sb("GET", "/rest/v1/tickets", params={"id": f"eq.{tid}", "user_id": f"eq.{uid}", "select": "*"}).json()
+        if not righe:
+            return errore("Ticket non trovato.", 404)
+        t = righe[0]
+        if t.get("status") != "open":
+            return errore("Questo ticket è chiuso: aprine uno nuovo se ti serve ancora aiuto.", 409)
+        gia = sb("GET", "/rest/v1/ticket_messages", params={"ticket_id": f"eq.{tid}", "select": "id", "limit": MAX_MESSAGGI_TICKET + 1}).json()
+        if len(gia) >= MAX_MESSAGGI_TICKET:
+            return errore("Questa conversazione è molto lunga: apri un nuovo ticket.", 409)
+        nuovo = sb("POST", "/rest/v1/ticket_messages",
+                   corpo={"ticket_id": tid, "author": "user", "author_email": utente.get("email"), "body": testo},
+                   extra={"Prefer": "return=representation"}).json()
+        sb("PATCH", "/rest/v1/tickets", params={"id": f"eq.{tid}"}, corpo={"last_author": "user"})
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    invia_email_assistenza(
+        f"[MiczyAI] Nuova risposta al ticket #{tid}: {t.get('subject')}",
+        f"Da: {utente.get('email')}\nTicket #{tid}: {t.get('subject')}\n\n{testo}\n\n"
+        "Rispondi dal pannello admin (scheda Ticket).",
+        rispondi_a=utente.get("email"),
+        html_corpo=html_email_ticket(tid, utente.get("email"), t.get("category"), t.get("subject"), testo, nuovo=False))
+    m = nuovo[0] if nuovo else {"author": "user", "body": testo}
+    return jsonify({"ok": True, "message": {"id": m.get("id"), "author": "user", "body": m.get("body"),
+                                            "created_at": m.get("created_at")}})
+
+
 @app.route("/admin/tickets", methods=["GET"])
 def admin_ticket():
     """Elenco dei ticket: ?status=open (predefinito), closed o all."""
@@ -2062,9 +2123,16 @@ def admin_ticket():
         righe = sb("GET", "/rest/v1/tickets", params=params).json()
         aperti = sb("GET", "/rest/v1/tickets", params={"status": "eq.open", "select": "id", "limit": 500}).json()
     except SupabaseNonDisponibile as e:
-        if "HTTP 404" in str(e):
-            return errore_admin("Manca la tabella: esegui migrazione-ticket.sql nel SQL Editor di Supabase.", 503)
+        if "HTTP 404" in str(e) or "HTTP 400" in str(e):
+            return errore_admin("Manca la tabella: esegui migrazione-ticket.sql e migrazione-ticket2.sql nel SQL Editor di Supabase.", 503)
         return errore_admin("Database non disponibile", 503)
+    try:
+        conv = _messaggi_dei_ticket([t.get("id") for t in righe])
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    for t in righe:
+        t["messages"] = [{"id": m.get("id"), "author": m.get("author"), "author_email": m.get("author_email"),
+                          "body": m.get("body"), "created_at": m.get("created_at")} for m in conv.get(t.get("id"), [])]
     return jsonify({"tickets": righe, "open_count": len(aperti)})
 
 
@@ -2080,12 +2148,12 @@ def admin_ticket_aggiorna():
         return errore_admin("Ticket non valido", 400)
     modifiche = {}
     risposta = dati.get("reply")
+    testo_risposta = None
     if risposta is not None:
-        testo = _testo_ticket(risposta, 1, 2000, False)
-        if not testo:
+        testo_risposta = _testo_ticket(risposta, 1, 2000, False)
+        if not testo_risposta:
             return errore_admin("La risposta deve avere da 1 a 2000 caratteri", 400)
-        modifiche.update({"reply": testo, "replied_at": datetime.now(timezone.utc).isoformat(),
-                          "replied_by": admin.get("email")})
+        modifiche["last_author"] = "admin"
     nuovo_stato = dati.get("status")
     if nuovo_stato is not None:
         if nuovo_stato not in ("open", "closed"):
@@ -2097,14 +2165,17 @@ def admin_ticket_aggiorna():
     try:
         esito = sb("PATCH", "/rest/v1/tickets", params={"id": f"eq.{tid}"}, corpo=modifiche,
                    extra={"Prefer": "return=representation"}).json()
+        if not esito:
+            return errore_admin("Ticket non trovato", 404)
+        if testo_risposta:
+            sb("POST", "/rest/v1/ticket_messages",
+               corpo={"ticket_id": tid, "author": "admin", "author_email": admin.get("email"), "body": testo_risposta})
     except SupabaseNonDisponibile as e:
         return _errore_db(e)
-    if not esito:
-        return errore_admin("Ticket non trovato", 404)
     t = esito[0]
     registra_azione(admin, "ticket", t.get("user_id"), t.get("email"),
-                    f"ticket #{tid}: " + ("risposta" if "reply" in modifiche else "") +
-                    (" " if "reply" in modifiche and "status" in modifiche else "") +
+                    f"ticket #{tid}: " + ("risposta" if testo_risposta else "") +
+                    (" " if testo_risposta and "status" in modifiche else "") +
                     (("chiuso" if nuovo_stato == "closed" else "riaperto") if "status" in modifiche else ""))
     return jsonify({"ok": True, "ticket": t})
 
