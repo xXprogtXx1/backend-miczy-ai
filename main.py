@@ -30,6 +30,7 @@ Tutte le impostazioni arrivano dalle variabili d'ambiente di Render, MAI dal cod
 """
 
 import copy
+import html
 import hashlib
 import json
 import os
@@ -64,6 +65,8 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 SUPPORT_NOTIFY_EMAIL = os.environ.get("SUPPORT_NOTIFY_EMAIL", "").strip()
 SUPPORT_FROM = os.environ.get("SUPPORT_FROM", "MiczyAI <onboarding@resend.dev>").strip()
+# Indirizzo del sito (facoltativo, es. https://xxprogtxx1.github.io/miczyaitest/): nell'email compare il pulsante "Apri i ticket".
+SITE_URL = os.environ.get("SITE_URL", "").strip().rstrip("/")
 # "0" (predefinito, più sicuro): non si inoltra nulla da sé; su Discord arriva solo ciò che un utente
 #     registrato invia col pulsante.
 # "1": ogni domanda viene inoltrata a Discord in automatico (chiunque potrebbe farci arrivare testo).
@@ -1938,12 +1941,47 @@ def _testo_ticket(valore, minimo, massimo, una_riga):
     return pulito if minimo <= len(pulito) <= massimo else None
 
 
-def invia_email_assistenza(oggetto, testo, rispondi_a=None):
+def html_email_ticket(numero, da, categoria, oggetto, messaggio):
+    """Versione grafica dell'email di avviso. Tutto il testo dell'utente passa da html.escape."""
+    e = lambda v: html.escape(str(v or ""), quote=True)
+    nomi = {"account": "Account e accesso", "chat": "Chat e risposte", "bug": "Qualcosa non funziona", "idea": "Un'idea", "altro": "Altro"}
+    msg = e(messaggio).replace("\n", "<br>")
+    bottone = ""
+    if SITE_URL.startswith("https://"):
+        bottone = ('<tr><td align="center" style="padding:6px 0 22px"><a href="' + e(SITE_URL) + '/admin/" style="display:inline-block;'
+                   'background:#ff5aa5;color:#17131f;font:800 16px Arial,Helvetica,sans-serif;text-decoration:none;padding:13px 26px;'
+                   'border:3px solid #17131f;border-radius:999px;box-shadow:4px 4px 0 #17131f">Apri i ticket</a></td></tr>')
+    return f'''<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light only"><title>Nuovo ticket #{e(numero)}</title></head>
+<body style="margin:0;padding:0;background:#fff3c4" bgcolor="#fff3c4">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0">{e(oggetto)}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#fff3c4"><tr><td align="center" style="padding:28px 14px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:540px">
+<tr><td align="center" style="padding:0 0 16px;font:900 28px Arial Black,Arial,Helvetica,sans-serif;color:#17131f;letter-spacing:-1px">Miczy<span style="background:#ff5aa5;padding:0 6px;border-radius:8px">AI</span></td></tr>
+<tr><td bgcolor="#ffffff" style="background:#ffffff;border:3px solid #17131f;border-radius:22px;box-shadow:6px 6px 0 #17131f">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+<tr><td bgcolor="#ffd93d" style="background:#ffd93d;border-bottom:3px solid #17131f;border-radius:19px 19px 0 0;padding:16px 24px;font:800 14px Arial,Helvetica,sans-serif;color:#17131f">🎫&nbsp; Nuovo ticket #{e(numero)}</td></tr>
+<tr><td style="padding:24px 26px 8px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+<tr><td style="font:900 22px/1.25 Arial,Helvetica,sans-serif;color:#17131f;padding:0 0 12px">{e(oggetto)}</td></tr>
+<tr><td style="padding:0 0 16px"><span style="display:inline-block;background:#e9e2ff;border:2px solid #17131f;border-radius:999px;padding:3px 12px;font:800 12px Arial,Helvetica,sans-serif;color:#17131f">{e(nomi.get(categoria, "Altro"))}</span>
+&nbsp;<span style="font:13px Arial,Helvetica,sans-serif;color:#4a4458">da <b>{e(da)}</b></span></td></tr>
+<tr><td style="font:16px/1.6 Arial,Helvetica,sans-serif;color:#2b2536;background:#faf7ff;border-left:5px solid #ff5aa5;border-radius:6px;padding:14px 16px">{msg}</td></tr>
+<tr><td style="height:20px"></td></tr>
+{bottone}
+<tr><td style="font:13px/1.6 Arial,Helvetica,sans-serif;color:#4a4458;border-top:2px dashed #d9d3e3;padding:14px 0 22px">Rispondi dal pannello admin (scheda <b>Ticket</b>): l'utente vedrà la risposta nelle sue Impostazioni. Se rispondi a questa email, scrivi direttamente a {e(da)}.</td></tr>
+</table></td></tr></table></td></tr>
+<tr><td align="center" style="padding:16px 8px 0;font:12px/1.6 Arial,Helvetica,sans-serif;color:#6b6478">Notifica automatica di MiczyAI.</td></tr>
+</table></td></tr></table></body></html>'''
+
+
+def invia_email_assistenza(oggetto, testo, rispondi_a=None, html_corpo=None):
     """Ti scrive per un nuovo ticket (Resend). In background: se fallisce il ticket resta salvato."""
     if not (RESEND_API_KEY and SUPPORT_NOTIFY_EMAIL):
         return
     corpo = {"from": SUPPORT_FROM, "to": [SUPPORT_NOTIFY_EMAIL],
              "subject": " ".join(str(oggetto).split())[:150], "text": str(testo)[:5000]}
+    if html_corpo:
+        corpo["html"] = str(html_corpo)[:60000]
     if rispondi_a and re.fullmatch(r"[^\s@<>,;]+@[^\s@<>,;]+", rispondi_a):
         corpo["reply_to"] = rispondi_a
 
@@ -2004,7 +2042,8 @@ def ticket_utente():
         f"[MiczyAI] Nuovo ticket #{t.get('id', '?')}: {oggetto}",
         f"Da: {utente.get('email')}\nCategoria: {categoria}\nOggetto: {oggetto}\n\n{messaggio}\n\n"
         "Rispondi dal pannello admin (scheda Ticket): l'utente vedrà la risposta nelle Impostazioni.",
-        rispondi_a=utente.get("email"))
+        rispondi_a=utente.get("email"),
+        html_corpo=html_email_ticket(t.get("id", "?"), utente.get("email"), categoria, oggetto, messaggio))
     app.logger.info("Nuovo ticket %s da %s", t.get("id"), uid)
     return jsonify({"ok": True, "ticket": _ticket_pubblico(t)})
 
