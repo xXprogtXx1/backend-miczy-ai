@@ -59,6 +59,11 @@ app.config["MAX_CONTENT_LENGTH"] = 64 * 1024  # corpo della richiesta: max 64 KB
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# Assistenza: email che ti avvisa dei nuovi ticket (servizio Resend, https://resend.com, piano gratuito).
+# Senza RESEND_API_KEY o SUPPORT_NOTIFY_EMAIL i ticket vengono comunque salvati e li vedi nel pannello admin.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+SUPPORT_NOTIFY_EMAIL = os.environ.get("SUPPORT_NOTIFY_EMAIL", "").strip()
+SUPPORT_FROM = os.environ.get("SUPPORT_FROM", "MiczyAI <onboarding@resend.dev>").strip()
 # "0" (predefinito, più sicuro): non si inoltra nulla da sé; su Discord arriva solo ciò che un utente
 #     registrato invia col pulsante.
 # "1": ogni domanda viene inoltrata a Discord in automatico (chiunque potrebbe farci arrivare testo).
@@ -209,6 +214,8 @@ limite_letture = LimitatoreRichieste(30, 3000)    # aprire un link condiviso: pe
 limite_health = LimitatoreRichieste(60, 5000)     # sveglia del server all'apertura del sito: per IP
 limite_quota = LimitatoreRichieste(30, 3000)      # contatore messaggi degli ospiti: per IP
 limite_importazioni = LimitatoreRichieste(2, 5)   # salvare nell'account la chat fatta da ospite: per utente
+limite_ticket = LimitatoreRichieste(2, 5)         # aprire ticket: per utente, 2 al minuto e 5 al giorno
+limite_ticket_letture = LimitatoreRichieste(20, 500)  # elenco dei propri ticket: per utente
 
 
 # --- Supabase -------------------------------------------------------------------
@@ -1914,6 +1921,153 @@ def home():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "accounts": ACCOUNTS_ATTIVI})
+
+
+# --- Assistenza tecnica: ticket ------------------------------------------------
+
+CATEGORIE_TICKET = ("account", "chat", "bug", "idea", "altro")
+MAX_TICKET_APERTI = 5
+
+
+def _testo_ticket(valore, minimo, massimo, una_riga):
+    """Testo scritto dall'utente: niente caratteri di controllo. Una riga sola per l'oggetto."""
+    if not isinstance(valore, str):
+        return None
+    pulito = "".join(c for c in valore if c in "\n\t" or ord(c) >= 32)
+    pulito = " ".join(pulito.split()) if una_riga else "\n".join(r.rstrip() for r in pulito.strip().splitlines())
+    return pulito if minimo <= len(pulito) <= massimo else None
+
+
+def invia_email_assistenza(oggetto, testo, rispondi_a=None):
+    """Ti scrive per un nuovo ticket (Resend). In background: se fallisce il ticket resta salvato."""
+    if not (RESEND_API_KEY and SUPPORT_NOTIFY_EMAIL):
+        return
+    corpo = {"from": SUPPORT_FROM, "to": [SUPPORT_NOTIFY_EMAIL],
+             "subject": " ".join(str(oggetto).split())[:150], "text": str(testo)[:5000]}
+    if rispondi_a and re.fullmatch(r"[^\s@<>,;]+@[^\s@<>,;]+", rispondi_a):
+        corpo["reply_to"] = rispondi_a
+
+    def _invia():
+        try:
+            r = requests.post("https://api.resend.com/emails", json=corpo, timeout=10,
+                              headers={"Authorization": "Bearer " + RESEND_API_KEY})
+            if r.status_code >= 300:
+                app.logger.warning("Email assistenza non inviata: HTTP %s", r.status_code)
+        except requests.RequestException as e:
+            app.logger.warning("Email assistenza non inviata: %s", type(e).__name__)
+    in_background(_invia)
+
+
+def _ticket_pubblico(t):
+    return {"id": t.get("id"), "category": t.get("category"), "subject": t.get("subject"),
+            "message": t.get("message"), "status": t.get("status"), "reply": t.get("reply"),
+            "replied_at": t.get("replied_at"), "created_at": t.get("created_at")}
+
+
+@app.route("/tickets", methods=["GET", "POST"])
+def ticket_utente():
+    """GET: i tuoi ticket con le risposte. POST {subject, category, message}: apre un ticket e ti avvisa per email."""
+    utente, err = richiedi_utente()
+    if err:
+        return err
+    uid = utente["id"]
+    limite = limite_ticket if request.method == "POST" else limite_ticket_letture
+    consentita, attesa, _ = limite.controlla(uid)
+    if not consentita:
+        return _troppe(attesa)
+    try:
+        if request.method == "GET":
+            righe = sb("GET", "/rest/v1/tickets", params={
+                "user_id": f"eq.{uid}", "order": "created_at.desc", "limit": 20, "select": "*"}).json()
+            return jsonify({"tickets": [_ticket_pubblico(t) for t in righe]})
+
+        dati = _corpo_json()
+        oggetto = _testo_ticket(dati.get("subject"), 3, 100, True)
+        messaggio = _testo_ticket(dati.get("message"), 10, 2000, False)
+        categoria = dati.get("category") if dati.get("category") in CATEGORIE_TICKET else "altro"
+        if not oggetto:
+            return errore("Scrivi un oggetto (da 3 a 100 caratteri).", 400)
+        if not messaggio:
+            return errore("Descrivi il problema (da 10 a 2000 caratteri).", 400)
+        aperti = sb("GET", "/rest/v1/tickets", params={
+            "user_id": f"eq.{uid}", "status": "eq.open", "select": "id", "limit": MAX_TICKET_APERTI + 1}).json()
+        if len(aperti) >= MAX_TICKET_APERTI:
+            return errore("Hai già %d ticket aperti: aspetta una risposta prima di aprirne altri." % MAX_TICKET_APERTI, 409)
+        nuovo = sb("POST", "/rest/v1/tickets",
+                   corpo={"user_id": uid, "email": utente.get("email"), "category": categoria,
+                          "subject": oggetto, "message": messaggio},
+                   extra={"Prefer": "return=representation"}).json()
+    except SupabaseNonDisponibile as e:
+        return _manca_migrazione(e)
+    t = nuovo[0] if nuovo else {"subject": oggetto, "message": messaggio, "category": categoria, "status": "open"}
+    invia_email_assistenza(
+        f"[MiczyAI] Nuovo ticket #{t.get('id', '?')}: {oggetto}",
+        f"Da: {utente.get('email')}\nCategoria: {categoria}\nOggetto: {oggetto}\n\n{messaggio}\n\n"
+        "Rispondi dal pannello admin (scheda Ticket): l'utente vedrà la risposta nelle Impostazioni.",
+        rispondi_a=utente.get("email"))
+    app.logger.info("Nuovo ticket %s da %s", t.get("id"), uid)
+    return jsonify({"ok": True, "ticket": _ticket_pubblico(t)})
+
+
+@app.route("/admin/tickets", methods=["GET"])
+def admin_ticket():
+    """Elenco dei ticket: ?status=open (predefinito), closed o all."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    stato = request.args.get("status", "open")
+    params = {"order": "created_at.desc", "limit": 100, "select": "*"}
+    if stato in ("open", "closed"):
+        params["status"] = f"eq.{stato}"
+    try:
+        righe = sb("GET", "/rest/v1/tickets", params=params).json()
+        aperti = sb("GET", "/rest/v1/tickets", params={"status": "eq.open", "select": "id", "limit": 500}).json()
+    except SupabaseNonDisponibile as e:
+        if "HTTP 404" in str(e):
+            return errore_admin("Manca la tabella: esegui migrazione-ticket.sql nel SQL Editor di Supabase.", 503)
+        return errore_admin("Database non disponibile", 503)
+    return jsonify({"tickets": righe, "open_count": len(aperti)})
+
+
+@app.route("/admin/tickets/update", methods=["POST"])
+def admin_ticket_aggiorna():
+    """Risponde a un ticket e/o lo chiude o lo riapre. Corpo: {id, reply?, status?}."""
+    admin, err = richiedi_admin()
+    if err:
+        return err
+    dati = _corpo_json()
+    tid = dati.get("id")
+    if isinstance(tid, bool) or not isinstance(tid, int) or not 0 < tid < 2**62:
+        return errore_admin("Ticket non valido", 400)
+    modifiche = {}
+    risposta = dati.get("reply")
+    if risposta is not None:
+        testo = _testo_ticket(risposta, 1, 2000, False)
+        if not testo:
+            return errore_admin("La risposta deve avere da 1 a 2000 caratteri", 400)
+        modifiche.update({"reply": testo, "replied_at": datetime.now(timezone.utc).isoformat(),
+                          "replied_by": admin.get("email")})
+    nuovo_stato = dati.get("status")
+    if nuovo_stato is not None:
+        if nuovo_stato not in ("open", "closed"):
+            return errore_admin("Stato non valido", 400)
+        modifiche["status"] = nuovo_stato
+        modifiche["closed_at"] = datetime.now(timezone.utc).isoformat() if nuovo_stato == "closed" else None
+    if not modifiche:
+        return errore_admin("Niente da cambiare", 400)
+    try:
+        esito = sb("PATCH", "/rest/v1/tickets", params={"id": f"eq.{tid}"}, corpo=modifiche,
+                   extra={"Prefer": "return=representation"}).json()
+    except SupabaseNonDisponibile as e:
+        return _errore_db(e)
+    if not esito:
+        return errore_admin("Ticket non trovato", 404)
+    t = esito[0]
+    registra_azione(admin, "ticket", t.get("user_id"), t.get("email"),
+                    f"ticket #{tid}: " + ("risposta" if "reply" in modifiche else "") +
+                    (" " if "reply" in modifiche and "status" in modifiche else "") +
+                    (("chiuso" if nuovo_stato == "closed" else "riaperto") if "status" in modifiche else ""))
+    return jsonify({"ok": True, "ticket": t})
 
 
 if __name__ == "__main__":
